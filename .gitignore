@@ -1,0 +1,41 @@
+# PlatformIO build artifacts
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+.ccls
+
+# IDE files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Dependencies (managed by PlatformIO)
+lib/
+libdeps/
+
+# Build outputs
+*.bin
+*.elf
+*.hex
+*.map
+
+# Environment specific
+.env
+.env.local
