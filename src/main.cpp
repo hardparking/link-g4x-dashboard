@@ -26,6 +26,7 @@ enum Metric : uint8_t {
   METRIC_KNOCK_LEVEL,       // Knock Level (Frame 1004)
   METRIC_BOOST_DUTY,        // Boost Control Duty (Frame 1004)
   METRIC_LAMBDA_COMBINED,   // Lambda + Target Combined Graph (special - uses local target)
+  METRIC_G_FORCE,           // G-Force Display (IMU-based - lateral/longitudinal)
   METRIC_COUNT              // Total number of metrics
 };
 
@@ -63,6 +64,11 @@ struct ECUData {
 
   // Calculated/derived values
   float lambda_target = 1.00;    // Lambda Target (calculated locally)
+
+  // IMU-based G-force data (from built-in accelerometer)
+  float g_force_lateral = 0.0;   // Lateral G-force (left/right)
+  float g_force_longitudinal = 0.0; // Longitudinal G-force (accel/brake)
+  float g_force_total = 0.0;      // Total G-force magnitude
 
   unsigned long last_update = 0;
 };
@@ -137,6 +143,174 @@ bool can_initialized = false;
 unsigned long last_can_message = 0;
 unsigned long can_message_count = 0;
 
+// CAN Message Buffer for smooth display updates
+#define CAN_BUFFER_SIZE 32
+struct CANBuffer {
+  twai_message_t messages[CAN_BUFFER_SIZE];
+  volatile int write_index = 0;
+  volatile int read_index = 0;
+  volatile int count = 0;
+} can_buffer;
+
+// CAN Buffer Management Functions
+bool addToCANBuffer(const twai_message_t& msg) {
+  if (can_buffer.count >= CAN_BUFFER_SIZE) {
+    return false; // Buffer full
+  }
+
+  can_buffer.messages[can_buffer.write_index] = msg;
+  can_buffer.write_index = (can_buffer.write_index + 1) % CAN_BUFFER_SIZE;
+  can_buffer.count++;
+  return true;
+}
+
+bool getFromCANBuffer(twai_message_t& msg) {
+  if (can_buffer.count == 0) {
+    return false; // Buffer empty
+  }
+
+  msg = can_buffer.messages[can_buffer.read_index];
+  can_buffer.read_index = (can_buffer.read_index + 1) % CAN_BUFFER_SIZE;
+  can_buffer.count--;
+  return true;
+}
+
+// Process a single CAN message (moved from main loop for buffering)
+void processCANMessage(const twai_message_t& canMsg) {
+  // Parse Haltech IC7 CAN Protocol (Multiple frames: 0x360, 0x361, 0x362, 0x3E0, etc.)
+  if (canMsg.data_length_code == 8) {
+
+    // Frame 0x360 (864): Engine Speed, MAP, TPS (Main) - 50Hz
+    if (canMsg.identifier == 864) {
+      // Haltech CAN V2 Protocol - Frame 0x360 (BIG ENDIAN - MSB first)
+      // Bytes 0-1: RPM (direct value, revolutions per minute)
+      ecu_data.rpm = (canMsg.data[0] << 8) | canMsg.data[1];
+
+      // Bytes 2-3: MAP (1/10th kPa)
+      uint16_t map_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+      ecu_data.mgp = map_raw * 0.1; // Convert to kPa
+
+      // Bytes 4-5: TPS (1/10th of 1%)
+      uint16_t tps_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+      ecu_data.tps = tps_raw * 0.1; // Convert to percentage
+
+      // Bytes 6-7: Reserved or additional data
+
+      // Automatically disable simulation mode when real CAN data is received
+      static bool simulation_disabled = false;
+      if (config.simulation_mode && !simulation_disabled) {
+        config.simulation_mode = false;
+        simulation_disabled = true;
+        Serial.println("HALTECH IC7 CAN DATA - Simulation disabled");
+        // Note: saveConfig() will be called from main loop
+      }
+
+      // Trigger display update for responsive UI
+      display_needs_update = true;
+
+      // Minimal frame 0x360 debug (reduced frequency for performance)
+      static unsigned long last_360_debug = 0;
+      if (millis() - last_360_debug > 30000) { // Only every 30 seconds
+        Serial.printf("Frame 0x360: RPM=%d MAP=%.1f TPS=%.1f\n", (int)ecu_data.rpm, ecu_data.mgp, ecu_data.tps);
+        last_360_debug = millis();
+      }
+    }
+
+    // Frame 0x361 (865): Fuel Pressure, Oil Pressure - 50Hz
+    else if (canMsg.identifier == 865) {
+      // Haltech CAN V2 Protocol - Frame 0x361 (BIG ENDIAN - MSB first)
+      // Bytes 0-1: Fuel Pressure (1/10th kPa)
+      uint16_t fuel_press_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+      ecu_data.fuel_pressure = fuel_press_raw * 0.1; // Convert to kPa
+
+      // Bytes 2-3: Oil Pressure (1/10th kPa)
+      uint16_t oil_press_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+      ecu_data.oil_pressure = oil_press_raw * 0.1; // Convert to kPa
+
+      // Bytes 4-7: Reserved or additional data (not specified in FTY Racing spec)
+      display_needs_update = true; // Trigger display update
+    }
+
+    // Frame 0x362 (866): Injector Duty Cycle, Ignition Angle - 50Hz
+    else if (canMsg.identifier == 866) {
+      // Haltech CAN V2 Protocol - Frame 0x362 (BIG ENDIAN - MSB first)
+      // Bytes 0-1: Primary Injector Duty (1/10th of 1%)
+      uint16_t inj_duty_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+      // ecu_data.injector_duty = inj_duty_raw * 0.1; // Could add this to ECUData structure
+
+      // Bytes 2-3: Secondary Injector Duty (1/10th of 1%)
+      uint16_t inj_duty2_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+      // ecu_data.injector_duty2 = inj_duty2_raw * 0.1; // Could add this to ECUData structure
+
+      // Bytes 4-5: Ignition Angle Leading (1/10th of a degree)
+      int16_t ignition_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+      ecu_data.ignition_timing = ignition_raw * 0.1; // Convert to degrees
+
+      // Bytes 6-7: Ignition Angle Trailing (1/10th of a degree)
+      // int16_t ignition_trail_raw = (canMsg.data[6] << 8) | canMsg.data[7];
+      // ecu_data.ignition_timing_trailing = ignition_trail_raw * 0.1; // Could add this
+      display_needs_update = true; // Trigger display update
+    }
+
+    // Frame 0x3E0 (992): ECT, IAT, Fuel Temperature, Oil Temperature - 5Hz
+    else if (canMsg.identifier == 992) {
+      // Haltech CAN V2 Protocol - Frame 0x3E0 (BIG ENDIAN - MSB first)
+      // Bytes 0-1: Coolant Temp (0.1 Kelvin)
+      uint16_t ect_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+      float new_ect = (ect_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
+
+      // Bytes 2-3: Air Temp (0.1 Kelvin) - Apply filtering for stability
+      uint16_t iat_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+      float new_iat = (iat_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
+
+      // Debug temperature values occasionally
+      static unsigned long last_temp_debug = 0;
+      if (millis() - last_temp_debug > 10000) {
+        Serial.printf("Temps: ECT_raw=%d (%.1f°C) IAT_raw=%d (%.1f°C)\n",
+                      ect_raw, new_ect, iat_raw, new_iat);
+        last_temp_debug = millis();
+      }
+
+      // Simple low-pass filter for IAT stability (only if value is reasonable)
+      if (new_iat > -40 && new_iat < 150) { // Sanity check for reasonable temperature range
+        ecu_data.iat = ecu_data.iat * 0.8 + new_iat * 0.2; // 80% old, 20% new
+      }
+
+      // ECT with less filtering (more responsive)
+      if (new_ect > -40 && new_ect < 150) {
+        ecu_data.ect = ecu_data.ect * 0.5 + new_ect * 0.5; // 50% old, 50% new
+      }
+
+      // Bytes 4-5: Fuel Temp (0.1 Kelvin)
+      uint16_t fuel_temp_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+      // ecu_data.fuel_temp = (fuel_temp_raw * 0.1) - 273.15; // Could add this to ECUData structure
+
+      // Bytes 6-7: Oil Temp (0.1 Kelvin)
+      uint16_t oil_temp_raw = (canMsg.data[6] << 8) | canMsg.data[7];
+      float new_oil_temp = (oil_temp_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
+      if (new_oil_temp > -40 && new_oil_temp < 200) {
+        ecu_data.oil_temp = ecu_data.oil_temp * 0.7 + new_oil_temp * 0.3; // 70% old, 30% new
+      }
+      display_needs_update = true; // Trigger display update
+    }
+
+    // Frame 0x368 (872): Lambda 1-2 - 20Hz
+    else if (canMsg.identifier == 872) {
+      // Haltech CAN V2 Protocol - Frame 0x368 (BIG ENDIAN - MSB first)
+      // Bytes 0-1: Lambda 1 (0.001 Lambda)
+      uint16_t lambda1_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+      ecu_data.lambda = lambda1_raw * 0.001; // Convert to lambda ratio
+
+      // Bytes 2-3: Lambda 2 (0.001 Lambda)
+      uint16_t lambda2_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+      // ecu_data.lambda2 = lambda2_raw * 0.001; // Could add this to ECUData structure
+
+      // Bytes 4-7: Reserved or additional data
+      display_needs_update = true; // Trigger display update
+    }
+  }
+}
+
 // Preferences for persistent storage
 Preferences preferences;
 
@@ -152,12 +326,12 @@ bool isMetricAvailable(Metric metric);
 void saveGaugeConfiguration();
 void loadGaugeConfiguration();
 
-// Default tile layout (Link G4X Generic Dash 2 CAN Stream - All Real Parameters)
+// Default tile layout (Link G4X Generic Dash 2 CAN Stream + G-Force Gauge)
 void setDefaultTileLayout() {
   g_tile_metric[0] = METRIC_RPM;              // r1c1 - Engine Speed (Frame 1000)
   g_tile_metric[1] = METRIC_TPS;              // r1c2 - Throttle Position (Frame 1000)
   g_tile_metric[2] = METRIC_MGP;              // r1c3 - Boost Pressure (Frame 1000)
-  g_tile_metric[3] = METRIC_LAMBDA_COMBINED;  // r1c4 - Lambda Combined Graph (Frame 1002)
+  g_tile_metric[3] = METRIC_G_FORCE;          // r1c4 - G-Force Gauge (IMU-based)
   g_tile_metric[4] = METRIC_ECT;              // r2c1 - Coolant Temperature (Frame 1000)
   g_tile_metric[5] = METRIC_OIL_TEMP;         // r2c2 - Oil Temperature (Frame 1001)
   g_tile_metric[6] = METRIC_IAT;              // r2c3 - Intake Air Temperature (Frame 1000)
@@ -192,6 +366,7 @@ const char* getMetricName(Metric metric) {
     case METRIC_KNOCK_LEVEL: return "KNOCK";
     case METRIC_BOOST_DUTY: return "BOOST DUTY";
     case METRIC_LAMBDA_COMBINED: return "LAMBDA GRAPH";
+    case METRIC_G_FORCE: return "G-FORCE";
     default: return "UNKNOWN";
   }
 }
@@ -232,6 +407,7 @@ const char* getMetricUnit(Metric metric) {
     case METRIC_KNOCK_LEVEL: return "";
     case METRIC_BOOST_DUTY: return "%";
     case METRIC_LAMBDA_COMBINED: return "";
+    case METRIC_G_FORCE: return "G";
     default: return "";
   }
 }
@@ -436,6 +612,93 @@ void drawLambdaDoubleArc(int x, int y, int w, int h, float lambda, float lambda_
 
     last_lambda[tile_index] = lambda;
     last_lambda_target[tile_index] = lambda_target;
+  }
+}
+
+// G-Force gauge with lateral and longitudinal display
+void drawGForceGauge(int x, int y, int w, int h, float lateral_g, float longitudinal_g, float total_g, int tile_index, bool force_redraw = false) {
+  static float last_lateral[12] = {0};
+  static float last_longitudinal[12] = {0};
+  static float last_total[12] = {0};
+
+  if (force_redraw ||
+      abs(lateral_g - last_lateral[tile_index]) > 0.01 ||
+      abs(longitudinal_g - last_longitudinal[tile_index]) > 0.01 ||
+      abs(total_g - last_total[tile_index]) > 0.01) {
+
+    // Full redraw - modern dark background
+    M5.Display.fillRoundRect(x, y, w, h, 12, 0x1082);
+    M5.Display.drawRoundRect(x, y, w, h, 12, 0x4208);
+
+    // Header
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString("G-FORCE", x + w/2, y + 20);
+
+    // Center point for the G-force circle
+    int center_x = x + w/2;
+    int center_y = y + h/2 + 10;
+    int circle_radius = min(w, h) / 3;
+
+    // Draw G-force circle background (gray)
+    M5.Display.drawCircle(center_x, center_y, circle_radius, 0x4208);
+    M5.Display.drawCircle(center_x, center_y, circle_radius/2, 0x2104);
+
+    // Draw crosshairs
+    M5.Display.drawLine(center_x - circle_radius, center_y, center_x + circle_radius, center_y, 0x4208);
+    M5.Display.drawLine(center_x, center_y - circle_radius, center_x, center_y + circle_radius, 0x4208);
+
+    // Calculate G-force dot position (scale to circle)
+    float scale = circle_radius / 1.0f; // 1G max scale (more sensitive)
+    int dot_x = center_x + (int)(lateral_g * scale);
+    int dot_y = center_y - (int)(longitudinal_g * scale); // Invert Y for screen coordinates
+
+    // Clamp to circle
+    float distance = sqrt((dot_x - center_x) * (dot_x - center_x) + (dot_y - center_y) * (dot_y - center_y));
+    if (distance > circle_radius) {
+      float ratio = circle_radius / distance;
+      dot_x = center_x + (int)((dot_x - center_x) * ratio);
+      dot_y = center_y + (int)((dot_y - center_y) * ratio);
+    }
+
+    // Draw G-force dot with color based on intensity (1G scale)
+    uint16_t dot_color = GOOD_COLOR;
+    if (total_g > 0.8) dot_color = WARNING_COLOR;      // Red above 0.8G
+    else if (total_g > 0.5) dot_color = CAUTION_COLOR; // Yellow above 0.5G
+
+    M5.Display.fillCircle(dot_x, dot_y, 6, dot_color);
+    M5.Display.drawCircle(dot_x, dot_y, 6, TFT_WHITE);
+
+    // Display numerical values
+    M5.Display.setFont(&fonts::DejaVu12);
+    M5.Display.setTextColor(TFT_WHITE);
+
+    // Total G-force (large)
+    char total_str[16];
+    sprintf(total_str, "%.2fG", total_g);
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.drawString(total_str, center_x, y + h - 40);
+
+    // Lateral and longitudinal (smaller)
+    M5.Display.setFont(&fonts::DejaVu12);
+    char lat_str[16], long_str[16];
+    sprintf(lat_str, "LAT: %.2f", lateral_g);
+    sprintf(long_str, "LON: %.2f", longitudinal_g);
+
+    M5.Display.setTextColor(0xBDF7); // Light gray
+    M5.Display.drawString(lat_str, center_x - 60, y + h - 20);
+    M5.Display.drawString(long_str, center_x + 60, y + h - 20);
+
+    // Scale labels (1G max scale)
+    M5.Display.setFont(&fonts::DejaVu9);
+    M5.Display.setTextColor(0x8410);
+    M5.Display.drawString("0.5G", center_x + circle_radius/2 + 5, center_y - 5);
+    M5.Display.drawString("1G", center_x + circle_radius + 5, center_y - 5);
+
+    last_lateral[tile_index] = lateral_g;
+    last_longitudinal[tile_index] = longitudinal_g;
+    last_total[tile_index] = total_g;
   }
 }
 
@@ -1109,6 +1372,13 @@ void drawMetric(int x, int y, int w, int h, Metric metric, int tile_index, bool 
       color = VALUE_COLOR;
       break;
     }
+    case METRIC_G_FORCE: {
+      // G-force gauge drawing (debug removed)
+
+      // Use special G-force display
+      drawGForceGauge(x, y, w, h, ecu_data.g_force_lateral, ecu_data.g_force_longitudinal, ecu_data.g_force_total, tile_index, force_redraw);
+      return; // Early return for special G-force display
+    }
     default: {
       sprintf(value_str, "0");
       color = LABEL_COLOR;
@@ -1249,6 +1519,9 @@ void simulateData() {
   ecu_data.boost_duty += random(-5, 5);
   ecu_data.boost_duty = constrain(ecu_data.boost_duty, 0, 100);
 
+  // NOTE: G-force data is NOT simulated - always comes from real IMU
+  // This ensures G-force readings are always accurate regardless of simulation mode
+
   display_needs_update = true;
 }
 
@@ -1265,9 +1538,9 @@ void drawGaugeConfigModal() {
   // Semi-transparent overlay
   M5.Display.fillScreen(0x2104); // Dark overlay
 
-  // Modal background
-  int modal_w = 800;
-  int modal_h = 600;
+  // Modal background - larger to accommodate 22 metrics
+  int modal_w = 1000;
+  int modal_h = 650;
   int modal_x = (1280 - modal_w) / 2;
   int modal_y = (720 - modal_h) / 2;
 
@@ -1286,15 +1559,15 @@ void drawGaugeConfigModal() {
   sprintf(current_info, "Tile %d: %s", selected_tile_index + 1, getMetricName(g_tile_metric[selected_tile_index]));
   M5.Display.drawString(current_info, modal_x + modal_w/2, modal_y + 60);
 
-  // Available metrics grid (3 columns, 5 rows)
+  // Available metrics grid (4 columns, 6 rows = 24 slots for 22 metrics)
   int grid_start_y = modal_y + 100;
-  int button_w = 220;
-  int button_h = 60;
-  int spacing = 20;
-  int cols = 3;
+  int button_w = 200;
+  int button_h = 55;
+  int spacing = 15;
+  int cols = 4;
 
   int metric_index = 0;
-  for (int row = 0; row < 5 && metric_index < METRIC_COUNT; row++) {
+  for (int row = 0; row < 6 && metric_index < METRIC_COUNT; row++) {
     for (int col = 0; col < cols && metric_index < METRIC_COUNT; col++) {
       Metric metric = (Metric)metric_index;
 
@@ -1342,8 +1615,8 @@ void drawGaugeConfigModal() {
 
 // Handle touch events in gauge configuration modal
 bool handleGaugeConfigTouch(int x, int y) {
-  int modal_w = 800;
-  int modal_h = 600;
+  int modal_w = 1000;
+  int modal_h = 650;
   int modal_x = (1280 - modal_w) / 2;
   int modal_y = (720 - modal_h) / 2;
 
@@ -1372,13 +1645,13 @@ bool handleGaugeConfigTouch(int x, int y) {
 
   // Check metric selection buttons
   int grid_start_y = modal_y + 100;
-  int button_w = 220;
-  int button_h = 60;
-  int spacing = 20;
-  int cols = 3;
+  int button_w = 200;
+  int button_h = 55;
+  int spacing = 15;
+  int cols = 4;
 
   int metric_index = 0;
-  for (int row = 0; row < 5 && metric_index < METRIC_COUNT; row++) {
+  for (int row = 0; row < 6 && metric_index < METRIC_COUNT; row++) {
     for (int col = 0; col < cols && metric_index < METRIC_COUNT; col++) {
       Metric metric = (Metric)metric_index;
 
@@ -1447,8 +1720,11 @@ bool initializeCAN() {
     return true;
   }
 
+  Serial.println("=== CAN INITIALIZATION DEBUG ===");
   Serial.println("CAN: Initializing ESP32-P4 internal TWAI controller...");
-  Serial.printf("CAN: Using TX pin G%d, RX pin G%d\n", CAN_TX_PIN, CAN_RX_PIN);
+  Serial.printf("CAN: Using TX pin G%d, RX pin G%d, DIR pin G%d\n", CAN_TX_PIN, CAN_RX_PIN, CAN_DIR_PIN);
+  Serial.printf("CAN: Haltech IC7 Protocol - Base ID = %d (0x%03X)\n", config.can_id_base, config.can_id_base);
+  Serial.printf("CAN: Expected Haltech IC7 frames: 864, 865, 866, 992, 872\n");
 
   // Set CAN pins
   ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
@@ -1475,108 +1751,257 @@ bool initializeCAN() {
   Serial.printf("CAN: Configured RS485 direction pin %d\n", CAN_DIR_PIN);
 
   // Initialize TWAI controller with specified speed using Tab5 RS485 interface
+  Serial.printf("CAN: Attempting to start TWAI at %d kbps...\n", speed_kbps);
   if (ESP32Can.begin(ESP32Can.convertSpeed(speed_kbps), CAN_TX_PIN, CAN_RX_PIN, 10, 10)) {
     Serial.println("CAN: Successfully initialized ESP32-P4 TWAI with Tab5 RS485 interface!");
+    Serial.println("CAN: Ready to receive frames - monitoring for ECU data...");
+    Serial.printf("CAN: Listening for Haltech IC7 frames: 864, 865, 866, 992, 872\n");
+    Serial.println("=== END CAN INITIALIZATION ===");
     can_initialized = true;
     return true;
   } else {
     Serial.println("CAN: Failed to initialize ESP32-P4 TWAI with Tab5 RS485 interface!");
+    Serial.println("CAN: Check wiring, CAN speed, and ECU configuration");
+    Serial.println("=== CAN INITIALIZATION FAILED ===");
     return false;
   }
 }
 
 // Read real CAN bus data using ESP32-P4 TWAI controller
 bool readCANData() {
+  static unsigned long last_debug_print = 0;
+  static unsigned long last_activity_check = 0;
+  static unsigned long total_frames_received = 0;
+
   if (config.simulation_mode || !can_initialized) {
     return false;
   }
 
   CanFrame canMsg;
   bool data_received = false;
+  int frames_this_cycle = 0;
 
-  // Read all available CAN messages with 10ms timeout
-  while (ESP32Can.readFrame(canMsg, 10)) {
+  // Read all available CAN messages with 1ms timeout (faster polling)
+  while (ESP32Can.readFrame(canMsg, 1)) {
     data_received = true;
+    frames_this_cycle++;
+    total_frames_received++;
     can_message_count++;
     last_can_message = millis();
 
-    // Parse Link G4X Generic Dash 2 CAN messages (4 frames: 1000, 1001, 1002, 1003)
+    // Convert CanFrame to twai_message_t for buffering
+    twai_message_t twai_msg;
+    twai_msg.identifier = canMsg.identifier;
+    twai_msg.data_length_code = canMsg.data_length_code;
+    memcpy(twai_msg.data, canMsg.data, 8);
+
+    // Add to buffer for smooth processing
+    if (!addToCANBuffer(twai_msg)) {
+      // Buffer full - process immediately to prevent data loss
+      processCANMessage(twai_msg);
+    }
+
+    // Minimal debug: Only log frame count occasionally
+    static unsigned long last_frame_log = 0;
+    static int frame_count = 0;
+    frame_count++;
+    if (millis() - last_frame_log > 5000) {
+      Serial.printf("CAN: %d frames received in last 5s\n", frame_count);
+      frame_count = 0;
+      last_frame_log = millis();
+    }
+
+    // Parse Haltech IC7 CAN Protocol (Multiple frames: 0x360, 0x361, 0x362, 0x3E0, etc.)
     if (canMsg.data_length_code == 8) {
 
-      // Frame 1000: Primary data (same as Dash2Pro for compatibility)
-      if (canMsg.identifier == config.can_id_base) {
-        // Byte 0-1: RPM (0-8000 RPM, 1 RPM resolution, little endian)
-        // Byte 2: TPS (0-100%, 0.5% resolution)
-        // Byte 3: ECT (0-200°C, 1°C resolution, offset -40°C)
-        // Byte 4: IAT (0-200°C, 1°C resolution, offset -40°C)
-        // Byte 5-6: MAP (0-600 kPa, 0.1 kPa resolution, little endian)
-        // Byte 7: Battery voltage (0-20V, 0.1V resolution)
+      // Minimal parsing debug
+      static unsigned long last_parse_debug = 0;
+      if (millis() - last_parse_debug > 30000) {
+        Serial.printf("CAN: Parsing Haltech IC7 frames starting at %d (0x%03X)\n", config.can_id_base, config.can_id_base);
+        last_parse_debug = millis();
+      }
 
-        ecu_data.rpm = (canMsg.data[1] << 8) | canMsg.data[0];
-        ecu_data.tps = canMsg.data[2] * 0.5;
-        ecu_data.ect = canMsg.data[3] - 40;
-        ecu_data.iat = canMsg.data[4] - 40;
-        ecu_data.mgp = ((canMsg.data[6] << 8) | canMsg.data[5]) * 0.1;
-        ecu_data.battery_voltage = canMsg.data[7] * 0.1;
+      // Frame 0x360 (864): Engine Speed, MAP, TPS (Main) - 50Hz
+      if (canMsg.identifier == 864) {
+        // Haltech CAN V2 Protocol - Frame 0x360 (BIG ENDIAN - MSB first)
+        // Bytes 0-1: RPM (direct value, revolutions per minute)
+        ecu_data.rpm = (canMsg.data[0] << 8) | canMsg.data[1];
+
+        // Bytes 2-3: MAP (1/10th kPa)
+        uint16_t map_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+        ecu_data.mgp = map_raw * 0.1; // Convert to kPa
+
+        // Bytes 4-5: TPS (1/10th of 1%)
+        uint16_t tps_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+        ecu_data.tps = tps_raw * 0.1; // Convert to percentage
+
+        // Bytes 6-7: Reserved or additional data
+
+        // Frame 1000 (ID X): Official Link Generic Dash 2 format - BIG ENDIAN (Motorola)
+        // Data 0-1: Engine Speed (RPM) = Raw, Range 0-15000 RPM
+        ecu_data.rpm = (canMsg.data[0] << 8) | canMsg.data[1];
+
+        // Data 2-3: MGP (kPa) = Raw - 100, Range -100 to 550 kPa
+        ecu_data.mgp = ((canMsg.data[2] << 8) | canMsg.data[3]) - 100;
+
+        // Data 4: ECT (°C) = Raw - 50, Range -50 to 205°C
+        ecu_data.ect = canMsg.data[4] - 50;
+
+        // Data 5: IAT (°C) = Raw - 50, Range -20 to 205°C
+        ecu_data.iat = canMsg.data[5] - 50;
+
+        // Data 6: ECU Volts (V) = Raw * 0.1, Range 0-30.0V
+        ecu_data.battery_voltage = canMsg.data[6] * 0.1;
+
+        // Data 7: Oil Temp (°C) = Raw - 50, Range -20 to 205°C
+        ecu_data.oil_temp = canMsg.data[7] - 50;
 
         ecu_data.last_update = millis();
 
-        Serial.printf("CAN Frame 1000: RPM=%d TPS=%.1f ECT=%.1f IAT=%.1f MAP=%.1f BATT=%.1f\n",
-                     (int)ecu_data.rpm, ecu_data.tps, ecu_data.ect, ecu_data.iat,
-                     ecu_data.mgp, ecu_data.battery_voltage);
+        // Automatically disable simulation mode when real CAN data is received
+        static bool simulation_disabled = false;
+        if (config.simulation_mode && !simulation_disabled) {
+          config.simulation_mode = false;
+          simulation_disabled = true;
+          Serial.println("HALTECH IC7 CAN DATA - Simulation disabled");
+          saveConfig(); // Save the change
+        }
+
+        // Trigger display update for responsive UI
+        display_needs_update = true;
+
+        // Minimal frame 0x360 debug (reduced frequency for performance)
+        static unsigned long last_360_debug = 0;
+        if (millis() - last_360_debug > 30000) { // Only every 30 seconds
+          Serial.printf("Frame 0x360: RPM=%d MAP=%.1f TPS=%.1f\n", (int)ecu_data.rpm, ecu_data.mgp, ecu_data.tps);
+          last_360_debug = millis();
+        }
       }
 
-      // Frame 1001: Extended data (Oil temp, ignition, speed)
-      else if (canMsg.identifier == config.can_id_base + 1) {
-        // Byte 0-1: Oil Temperature (1°C resolution, offset -40°C, little endian)
-        // Byte 2-3: Ignition Timing (0.1° resolution, signed, little endian)
-        // Byte 4-5: Vehicle Speed (0.1 km/h resolution, little endian)
-        // Byte 6-7: Reserved/unused
+      // Frame 0x361 (865): Fuel Pressure, Oil Pressure - 50Hz
+      else if (canMsg.identifier == 865) {
+        // Haltech CAN V2 Protocol - Frame 0x361 (BIG ENDIAN - MSB first)
+        // Bytes 0-1: Fuel Pressure (1/10th kPa)
+        uint16_t fuel_press_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+        ecu_data.fuel_pressure = fuel_press_raw * 0.1; // Convert to kPa
 
-        int16_t oil_temp_raw = (canMsg.data[1] << 8) | canMsg.data[0];
-        ecu_data.oil_temp = oil_temp_raw - 40;
+        // Bytes 2-3: Oil Pressure (1/10th kPa)
+        uint16_t oil_press_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+        ecu_data.oil_pressure = oil_press_raw * 0.1; // Convert to kPa
 
-        int16_t ignition_raw = (canMsg.data[3] << 8) | canMsg.data[2];
-        ecu_data.ignition_timing = ignition_raw * 0.1;
-
-        uint16_t speed_raw = (canMsg.data[5] << 8) | canMsg.data[4];
-        ecu_data.vehicle_speed = speed_raw * 0.1;
-
-        Serial.printf("CAN Frame 1001: OilTemp=%.1f Ignition=%.1f Speed=%.1f\n",
-                     ecu_data.oil_temp, ecu_data.ignition_timing, ecu_data.vehicle_speed);
+        // Bytes 4-7: Reserved or additional data (not specified in FTY Racing spec)
+        display_needs_update = true; // Trigger display update
       }
 
-      // Frame 1002: Pressures and Lambda
-      else if (canMsg.identifier == config.can_id_base + 2) {
-        // Byte 0-1: Oil Pressure (1 kPa resolution, little endian)
-        // Byte 2-3: Fuel Pressure (1 kPa resolution, little endian)
-        // Byte 4-5: Lambda 1 (0.001 resolution, little endian)
-        // Byte 6-7: Reserved/unused
+      // Frame 0x362 (866): Injector Duty Cycle, Ignition Angle - 50Hz
+      else if (canMsg.identifier == 866) {
+        // Haltech CAN V2 Protocol - Frame 0x362 (BIG ENDIAN - MSB first)
+        // Bytes 0-1: Primary Injector Duty (1/10th of 1%)
+        uint16_t inj_duty_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+        // ecu_data.injector_duty = inj_duty_raw * 0.1; // Could add this to ECUData structure
 
-        uint16_t oil_press_raw = (canMsg.data[1] << 8) | canMsg.data[0];
-        ecu_data.oil_pressure = oil_press_raw;
+        // Bytes 2-3: Secondary Injector Duty (1/10th of 1%)
+        uint16_t inj_duty2_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+        // ecu_data.injector_duty2 = inj_duty2_raw * 0.1; // Could add this to ECUData structure
 
-        uint16_t fuel_press_raw = (canMsg.data[3] << 8) | canMsg.data[2];
-        ecu_data.fuel_pressure = fuel_press_raw;
+        // Bytes 4-5: Ignition Angle Leading (1/10th of a degree)
+        int16_t ignition_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+        ecu_data.ignition_timing = ignition_raw * 0.1; // Convert to degrees
 
-        uint16_t lambda_raw = (canMsg.data[5] << 8) | canMsg.data[4];
-        ecu_data.lambda = lambda_raw * 0.001;
-
-        Serial.printf("CAN Frame 1002: OilPress=%d FuelPress=%d Lambda=%.3f\n",
-                     (int)ecu_data.oil_pressure, (int)ecu_data.fuel_pressure, ecu_data.lambda);
+        // Bytes 6-7: Ignition Angle Trailing (1/10th of a degree)
+        // int16_t ignition_trail_raw = (canMsg.data[6] << 8) | canMsg.data[7];
+        // ecu_data.ignition_timing_trailing = ignition_trail_raw * 0.1; // Could add this
+        display_needs_update = true; // Trigger display update
       }
 
-      // Frame 1003: Additional data
-      else if (canMsg.identifier == config.can_id_base + 3) {
-        // Byte 0-1: ECU Temperature (1°C resolution, offset -40°C, little endian)
-        // Byte 2-7: Reserved/unused for future expansion
+      // Frame 0x3E0 (992): ECT, IAT, Fuel Temperature, Oil Temperature - 5Hz
+      else if (canMsg.identifier == 992) {
+        // Debug: Check if we're actually receiving this frame
+        static unsigned long last_3e0_debug = 0;
+        if (millis() - last_3e0_debug > 10000) {
+          Serial.printf("Frame 0x3E0 RAW: [%02X %02X %02X %02X %02X %02X %02X %02X]\n",
+                        canMsg.data[0], canMsg.data[1], canMsg.data[2], canMsg.data[3],
+                        canMsg.data[4], canMsg.data[5], canMsg.data[6], canMsg.data[7]);
+          last_3e0_debug = millis();
+        }
 
-        int16_t ecu_temp_raw = (canMsg.data[1] << 8) | canMsg.data[0];
-        ecu_data.ecu_temp = ecu_temp_raw - 40;
+        // Haltech CAN V2 Protocol - Frame 0x3E0 (BIG ENDIAN - MSB first)
+        // Bytes 0-1: Coolant Temp (0.1 Kelvin)
+        uint16_t ect_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+        float new_ect = (ect_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
 
-        Serial.printf("CAN Frame 1003: ECUTemp=%.1f\n", ecu_data.ecu_temp);
+        // Bytes 2-3: Air Temp (0.1 Kelvin) - Apply filtering for stability
+        uint16_t iat_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+        float new_iat = (iat_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
+
+        // Debug temperature values
+        if (millis() - last_3e0_debug > 10000) {
+          Serial.printf("Temps: ECT_raw=%d (%.1f°C) IAT_raw=%d (%.1f°C)\n",
+                        ect_raw, new_ect, iat_raw, new_iat);
+        }
+
+        // Simple low-pass filter for IAT stability (only if value is reasonable)
+        if (new_iat > -40 && new_iat < 150) { // Sanity check for reasonable temperature range
+          ecu_data.iat = ecu_data.iat * 0.8 + new_iat * 0.2; // 80% old, 20% new
+        }
+
+        // ECT with less filtering (more responsive)
+        if (new_ect > -40 && new_ect < 150) {
+          ecu_data.ect = ecu_data.ect * 0.5 + new_ect * 0.5; // 50% old, 50% new
+        }
+
+        // Bytes 4-5: Fuel Temp (0.1 Kelvin)
+        uint16_t fuel_temp_raw = (canMsg.data[4] << 8) | canMsg.data[5];
+        // ecu_data.fuel_temp = (fuel_temp_raw * 0.1) - 273.15; // Could add this to ECUData structure
+
+        // Bytes 6-7: Oil Temp (0.1 Kelvin)
+        uint16_t oil_temp_raw = (canMsg.data[6] << 8) | canMsg.data[7];
+        float new_oil_temp = (oil_temp_raw * 0.1) - 273.15; // Convert from Kelvin to Celsius
+        if (new_oil_temp > -40 && new_oil_temp < 200) {
+          ecu_data.oil_temp = ecu_data.oil_temp * 0.7 + new_oil_temp * 0.3; // 70% old, 30% new
+        }
+        display_needs_update = true; // Trigger display update
+      }
+
+      // Frame 0x368 (872): Lambda 1-2 - 20Hz
+      else if (canMsg.identifier == 872) {
+        // Haltech CAN V2 Protocol - Frame 0x368 (BIG ENDIAN - MSB first)
+        // Bytes 0-1: Lambda 1 (0.001 Lambda)
+        uint16_t lambda1_raw = (canMsg.data[0] << 8) | canMsg.data[1];
+        ecu_data.lambda = lambda1_raw * 0.001; // Convert to lambda ratio
+
+        // Bytes 2-3: Lambda 2 (0.001 Lambda)
+        uint16_t lambda2_raw = (canMsg.data[2] << 8) | canMsg.data[3];
+        // ecu_data.lambda2 = lambda2_raw * 0.001; // Could add this to ECUData structure
+
+        // Bytes 4-7: Reserved or additional data
+        display_needs_update = true; // Trigger display update
       }
     }
+  }
+
+  // DEBUG: Print CAN statistics every 30 seconds (reduced for performance)
+  if (millis() - last_debug_print > 30000) {
+    Serial.printf("=== CAN DEBUG STATS ===\n");
+    Serial.printf("CAN Initialized: %s\n", can_initialized ? "YES" : "NO");
+    Serial.printf("Simulation Mode: %s\n", config.simulation_mode ? "YES" : "NO");
+    Serial.printf("Total Frames Received: %lu\n", total_frames_received);
+    Serial.printf("Frames This Cycle: %d\n", frames_this_cycle);
+    Serial.printf("Last Message: %lu ms ago\n", millis() - last_can_message);
+    Serial.printf("CAN Base ID: %d (0x%03X)\n", config.can_id_base, config.can_id_base);
+    Serial.printf("CAN Speed: %s\n", getCANSpeedName(config.can_speed));
+    Serial.printf("Expected Haltech IC7 Frame IDs: 864, 865, 866, 992, 872\n");
+    Serial.println("=== END CAN DEBUG ===");
+    last_debug_print = millis();
+  }
+
+  // DEBUG: Check for CAN activity timeout
+  if (millis() - last_activity_check > 10000) {
+    if (total_frames_received == 0) {
+      Serial.println("WARNING: No CAN frames received in 10 seconds!");
+      Serial.println("Check: ECU CAN output enabled, wiring, CAN speed, termination");
+    }
+    last_activity_check = millis();
   }
 
   return data_received;
@@ -1647,8 +2072,42 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Link G4X Dashboard Starting...");
 
+  // Initialize IMU for G-force measurements
+  if (M5.Imu.isEnabled()) {
+    auto imu_type = M5.Imu.getType();
+    const char* imu_name = "Unknown";
+    switch (imu_type) {
+      case m5::imu_none: imu_name = "None"; break;
+      case m5::imu_sh200q: imu_name = "SH200Q"; break;
+      case m5::imu_mpu6050: imu_name = "MPU6050"; break;
+      case m5::imu_mpu6886: imu_name = "MPU6886"; break;
+      case m5::imu_mpu9250: imu_name = "MPU9250"; break;
+      case m5::imu_bmi270: imu_name = "BMI270"; break;
+      default: imu_name = "Unknown"; break;
+    }
+    Serial.printf("IMU initialized: %s\n", imu_name);
+  } else {
+    Serial.println("IMU not found - G-force measurements disabled");
+  }
+
   // Load saved configuration
   loadConfig();
+
+  // FORCE CORRECT CAN CONFIGURATION FOR HALTECH IC7 PROTOCOL
+  bool config_changed = false;
+  if (config.can_id_base != 864) {
+    Serial.printf("🔧 SWITCHING TO HALTECH IC7: %d -> 864 (0x360)\n", config.can_id_base);
+    config.can_id_base = 864; // 0x360 - Primary Haltech IC7 frame
+    config_changed = true;
+  }
+  if (config.can_speed != CONFIG_CAN_500KBPS) {
+    Serial.printf("🔧 FIXING CAN SPEED: %s -> 500kbps (Haltech IC7)\n", getCANSpeedName(config.can_speed));
+    config.can_speed = CONFIG_CAN_500KBPS;
+    config_changed = true;
+  }
+  if (config_changed) {
+    saveConfig(); // Save the corrected configuration
+  }
 
   // Initialize CAN bus only if in real CAN mode
   // Don't override the saved configuration if CAN fails
@@ -1662,14 +2121,84 @@ void setup() {
   }
 
   setDefaultTileLayout();
-  loadGaugeConfiguration(); // Load saved gauge configuration or use defaults
 
-  Serial.printf("Dashboard initialized - Mode: %s\n",
-                config.simulation_mode ? "SIMULATION" : "REAL CAN BUS");
+  // Set default gauge layout and ensure proper display
+  setDefaultTileLayout();
+
+  // Force G-force gauge in position 3 (top-right)
+  g_tile_metric[3] = METRIC_G_FORCE;
+
+  // Load any saved gauge configuration (but keep G-force gauge)
+  loadGaugeConfiguration();
+  g_tile_metric[3] = METRIC_G_FORCE; // Ensure G-force gauge stays
+
+  Serial.println("Dashboard gauges configured - G-Force in position 3");
+
+  // Display complete configuration for debugging
+  Serial.println("=== DASHBOARD CONFIGURATION ===");
+  Serial.printf("Mode: %s\n", config.simulation_mode ? "SIMULATION" : "REAL CAN BUS");
+  Serial.printf("CAN Base ID: %d (0x%03X)\n", config.can_id_base, config.can_id_base);
+  Serial.printf("CAN Speed: %s\n", getCANSpeedName(config.can_speed));
+  Serial.printf("Units: %s\n", config.use_fahrenheit ? "Imperial (°F/PSI)" : "Metric (°C/kPa)");
+  Serial.printf("CAN Initialized: %s\n", can_initialized ? "YES" : "NO");
+  Serial.printf("Expected Haltech IC7 Frames: 0x360(864), 0x361(865), 0x362(866), 0x3E0(992), 0x368(872)\n");
+  Serial.println("=== DASHBOARD READY ===");
+
+  // Force initial display refresh to show gauges
+  M5.Display.fillScreen(BLACK);
+  Serial.println("Display cleared - gauges will appear on first update");
+}
+
+// Update G-force data from IMU - ALWAYS reads from real hardware regardless of simulation mode
+void updateGForceData() {
+  static unsigned long last_debug = 0;
+
+  if (!M5.Imu.isEnabled()) {
+    if (millis() - last_debug > 5000) {
+      Serial.println("IMU not enabled for G-force");
+      last_debug = millis();
+    }
+    return;
+  }
+
+  // Update IMU data
+  auto imu_update = M5.Imu.update();
+  if (imu_update) {
+    auto data = M5.Imu.getImuData();
+
+    // Convert accelerometer data to G-forces
+    // Device coordinate system (when mounted horizontally in car):
+    // X-axis = lateral (left/right) - positive = right turn G-force
+    // Y-axis = longitudinal (forward/back) - positive = acceleration G-force
+    // Z-axis = vertical (up/down) - subtract 1G for gravity
+
+    // Convert from m/s² to G (1G = 9.81 m/s²)
+    float lateral_g = data.accel.x / 9.81f;      // Lateral G-force
+    float longitudinal_g = data.accel.y / 9.81f; // Longitudinal G-force
+
+    // Apply lighter filtering for more sensitivity (less smoothing = more responsive)
+    static float alpha = 0.3f; // Filter coefficient (0.3 = lighter filtering, more sensitive)
+    ecu_data.g_force_lateral = (alpha * lateral_g) + ((1.0f - alpha) * ecu_data.g_force_lateral);
+    ecu_data.g_force_longitudinal = (alpha * longitudinal_g) + ((1.0f - alpha) * ecu_data.g_force_longitudinal);
+
+    // Calculate total G-force magnitude (excluding vertical/gravity)
+    ecu_data.g_force_total = sqrt(ecu_data.g_force_lateral * ecu_data.g_force_lateral +
+                                  ecu_data.g_force_longitudinal * ecu_data.g_force_longitudinal);
+
+    // Minimal G-force debug (removed excessive output)
+  } else {
+    if (millis() - last_debug > 5000) {
+      Serial.println("IMU update failed");
+      last_debug = millis();
+    }
+  }
 }
 
 void loop() {
   M5.update();
+
+  // Update G-force data from IMU
+  updateGForceData();
 
   // Read data from CAN bus or simulation
   if (config.simulation_mode) {
@@ -1686,10 +2215,12 @@ void loop() {
     }
   }
 
-  // Update display when data changes
-  if (display_needs_update) {
+  // Update display at high frequency for smooth updates
+  static unsigned long last_display_update = 0;
+  if (display_needs_update || (millis() - last_display_update > 100)) { // Update every 100ms (10Hz)
     updateDisplay();
     display_needs_update = false;
+    last_display_update = millis();
   }
 
   // Handle touch input
