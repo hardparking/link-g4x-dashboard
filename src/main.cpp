@@ -31,6 +31,12 @@ enum BufferSize {
   BUFFER_CUSTOM = 3     // User defined
 };
 
+enum ConfigTab {
+  TAB_BASIC = 0,        // Basic settings (CAN, Units, Simulation)
+  TAB_LOGGING = 1,      // Logging configuration
+  TAB_ADVANCED = 2      // Advanced settings (future)
+};
+
 struct Config {
   uint32_t base_can_id = 864;           // Base CAN ID for Haltech IC7
   uint32_t can_speed = 500000;          // CAN bus speed (500 kbps)
@@ -57,6 +63,9 @@ struct Config {
 
 Config config;
 Preferences preferences;
+
+// Configuration tab state
+ConfigTab current_config_tab = TAB_BASIC;
 
 // ========== UNIT CONVERSION FUNCTIONS ==========
 float convertTemperature(float celsius) {
@@ -139,6 +148,25 @@ uint16_t getBufferFrameCount() {
 
 bool isLoggingEnabled() {
   return config.logging_mode != LOG_DISABLED;
+}
+
+// ========== CONFIG TAB FUNCTIONS ==========
+const char* getConfigTabName(ConfigTab tab) {
+  switch (tab) {
+    case TAB_BASIC: return "BASIC";
+    case TAB_LOGGING: return "LOGGING";
+    case TAB_ADVANCED: return "ADVANCED";
+    default: return "BASIC";
+  }
+}
+
+const char* getConfigTabSubtitle(ConfigTab tab) {
+  switch (tab) {
+    case TAB_BASIC: return "基本設定";
+    case TAB_LOGGING: return "ログ設定";
+    case TAB_ADVANCED: return "高度設定";
+    default: return "基本設定";
+  }
 }
 
 // ========== CAN BUS CONFIGURATION ==========
@@ -710,80 +738,124 @@ void showConfigurationPage() {
   M5.Display.setTextColor(TFT_WHITE);
   M5.Display.drawString("SYSTEM CONFIG", screen_w/2, 25);
 
-  // Japanese subtitle
+  // Japanese subtitle (current tab)
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(M5.Display.color565(0, 255, 255));
-  M5.Display.drawString("システム設定", screen_w/2, 55); // "System Settings" in Japanese
+  M5.Display.drawString(getConfigTabSubtitle(current_config_tab), screen_w/2, 55);
 
-  // Configuration sections with 90's JDM styling
-  int section_y = 100;
+  // Tab bar (60px height for touch targets)
+  int tab_bar_y = 90;
+  int tab_bar_h = 60;
+  int tab_count = 3;
+  int tab_w = screen_w / tab_count;
+
+  M5.Display.fillRect(0, tab_bar_y, screen_w, tab_bar_h, M5.Display.color565(20, 20, 60));
+  M5.Display.drawLine(0, tab_bar_y + tab_bar_h, screen_w, tab_bar_y + tab_bar_h, M5.Display.color565(0, 255, 255));
+
+  // Draw tabs
+  for (int i = 0; i < tab_count; i++) {
+    ConfigTab tab = (ConfigTab)i;
+    bool active = (tab == current_config_tab);
+
+    int tab_x = i * tab_w;
+    uint16_t bg_color = active ? M5.Display.color565(0, 80, 120) : M5.Display.color565(20, 20, 60);
+    uint16_t text_color = active ? M5.Display.color565(0, 255, 255) : M5.Display.color565(100, 150, 200);
+    uint16_t border_color = active ? M5.Display.color565(0, 255, 255) : M5.Display.color565(50, 50, 100);
+
+    // Tab background
+    M5.Display.fillRect(tab_x, tab_bar_y, tab_w, tab_bar_h, bg_color);
+
+    // Tab borders
+    if (i > 0) {
+      M5.Display.drawLine(tab_x, tab_bar_y, tab_x, tab_bar_y + tab_bar_h, border_color);
+    }
+
+    // Active tab highlight
+    if (active) {
+      M5.Display.drawRect(tab_x + 2, tab_bar_y + 2, tab_w - 4, tab_bar_h - 4, M5.Display.color565(0, 255, 255));
+    }
+
+    // Tab text
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(text_color);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.drawString(getConfigTabName(tab), tab_x + tab_w/2, tab_bar_y + tab_bar_h/2);
+  }
+
+  // Tab content area
+  int content_y = tab_bar_y + tab_bar_h + 20;
   int section_h = 90;
   int section_spacing = 10;
+  int section_y = content_y;
 
-  // Data Source Section
-  drawJDMConfigSection("DATA SOURCE", "データソース", section_y,
-                      config.simulation_mode ? "SIMULATION" : "LIVE CAN",
-                      config.simulation_mode ? M5.Display.color565(255, 150, 0) : M5.Display.color565(0, 255, 100));
+  // Draw content based on current tab
+  switch (current_config_tab) {
+    case TAB_BASIC:
+      // Data Source Section
+      drawJDMConfigSection("DATA SOURCE", "データソース", section_y,
+                          config.simulation_mode ? "SIMULATION" : "LIVE CAN",
+                          config.simulation_mode ? M5.Display.color565(255, 150, 0) : M5.Display.color565(0, 255, 100));
+      section_y += section_h + section_spacing;
 
-  section_y += section_h + section_spacing;
+      // Stream Type Section
+      drawJDMConfigSection("STREAM TYPE", "ストリーム", section_y,
+                          config.use_custom_streams ? "CUSTOM" : "HALTECH IC7",
+                          config.use_custom_streams ? M5.Display.color565(0, 255, 200) : M5.Display.color565(255, 100, 255));
+      section_y += section_h + section_spacing;
 
-  // Stream Type Section
-  drawJDMConfigSection("STREAM TYPE", "ストリーム", section_y,
-                      config.use_custom_streams ? "CUSTOM" : "HALTECH IC7",
-                      config.use_custom_streams ? M5.Display.color565(0, 255, 200) : M5.Display.color565(255, 100, 255));
+      // CAN Speed Section
+      char can_speed_text[20];
+      sprintf(can_speed_text, "%d KBPS", config.can_speed / 1000);
+      drawJDMConfigSection("CAN SPEED", "CAN速度", section_y, can_speed_text, M5.Display.color565(255, 255, 0));
+      section_y += section_h + section_spacing;
 
-  section_y += section_h + section_spacing;
+      // CAN ID Section
+      char can_id_text[20];
+      sprintf(can_id_text, "%d", config.base_can_id);
+      drawJDMConfigSection("CAN BASE ID", "CAN ID", section_y, can_id_text, M5.Display.color565(255, 100, 255));
+      section_y += section_h + section_spacing;
 
-  // CAN Speed Section
-  char can_speed_text[20];
-  sprintf(can_speed_text, "%d KBPS", config.can_speed / 1000);
-  drawJDMConfigSection("CAN SPEED", "CAN速度", section_y, can_speed_text, M5.Display.color565(255, 255, 0));
+      // Units Section
+      drawJDMConfigSection("UNITS", "単位", section_y, getUnitSystemName(),
+                          config.units == METRIC ? M5.Display.color565(100, 255, 100) : M5.Display.color565(255, 165, 0));
+      break;
 
-  section_y += section_h + section_spacing;
+    case TAB_LOGGING:
+      // CAN Logging Mode Section
+      drawJDMConfigSection("LOG MODE", "ログモード", section_y, getLoggingModeName(),
+                          isLoggingEnabled() ? M5.Display.color565(255, 100, 100) : M5.Display.color565(100, 100, 100));
+      section_y += section_h + section_spacing;
 
-  // CAN ID Section
-  char can_id_text[20];
-  sprintf(can_id_text, "%d", config.base_can_id);
-  drawJDMConfigSection("CAN BASE ID", "CAN ID", section_y, can_id_text, M5.Display.color565(255, 100, 255));
+      // Log Detail Section (only show if logging is enabled)
+      if (isLoggingEnabled()) {
+        drawJDMConfigSection("LOG DETAIL", "ログ詳細", section_y, getLogDetailName(),
+                            M5.Display.color565(100, 255, 255));
+        section_y += section_h + section_spacing;
+      }
 
-  section_y += section_h + section_spacing;
+      // Buffer Size Section (only show if logging is enabled)
+      if (isLoggingEnabled()) {
+        char buffer_text[30];
+        sprintf(buffer_text, "%s (%d)", getBufferSizeName(), getBufferFrameCount());
+        drawJDMConfigSection("BUFFER SIZE", "バッファサイズ", section_y, buffer_text,
+                            M5.Display.color565(255, 255, 100));
+        section_y += section_h + section_spacing;
+      }
 
-  // Units Section
-  drawJDMConfigSection("UNITS", "単位", section_y, getUnitSystemName(),
-                      config.units == METRIC ? M5.Display.color565(100, 255, 100) : M5.Display.color565(255, 165, 0));
+      // Storage Settings Section (only show if logging is enabled)
+      if (isLoggingEnabled()) {
+        char storage_text[30];
+        sprintf(storage_text, "%dMB x%d", config.max_file_size_mb, config.max_files);
+        drawJDMConfigSection("STORAGE", "ストレージ", section_y, storage_text,
+                            M5.Display.color565(255, 165, 0));
+      }
+      break;
 
-  section_y += section_h + section_spacing;
-
-  // CAN Logging Mode Section
-  drawJDMConfigSection("LOG MODE", "ログモード", section_y, getLoggingModeName(),
-                      isLoggingEnabled() ? M5.Display.color565(255, 100, 100) : M5.Display.color565(100, 100, 100));
-
-  section_y += section_h + section_spacing;
-
-  // Log Detail Section (only show if logging is enabled)
-  if (isLoggingEnabled()) {
-    drawJDMConfigSection("LOG DETAIL", "ログ詳細", section_y, getLogDetailName(),
-                        M5.Display.color565(100, 255, 255));
-
-    section_y += section_h + section_spacing;
-  }
-
-  // Buffer Size Section (only show if logging is enabled)
-  if (isLoggingEnabled()) {
-    char buffer_text[30];
-    sprintf(buffer_text, "%s (%d)", getBufferSizeName(), getBufferFrameCount());
-    drawJDMConfigSection("BUFFER SIZE", "バッファサイズ", section_y, buffer_text,
-                        M5.Display.color565(255, 255, 100));
-
-    section_y += section_h + section_spacing;
-  }
-
-  // Storage Settings Section (only show if logging is enabled)
-  if (isLoggingEnabled()) {
-    char storage_text[30];
-    sprintf(storage_text, "%dMB x%d", config.max_file_size_mb, config.max_files);
-    drawJDMConfigSection("STORAGE", "ストレージ", section_y, storage_text,
-                        M5.Display.color565(255, 165, 0));
+    case TAB_ADVANCED:
+      // Future advanced settings will go here
+      drawJDMConfigSection("COMING SOON", "近日公開", section_y, "ADVANCED FEATURES",
+                          M5.Display.color565(150, 150, 150));
+      break;
   }
 
   // Bottom navigation bar with retro styling
@@ -2487,6 +2559,25 @@ bool handleConfigTouch(int x, int y) {
   int screen_w = M5.Display.width();
   int screen_h = M5.Display.height();
 
+  // Check tab bar touch (90-150px Y range)
+  int tab_bar_y = 90;
+  int tab_bar_h = 60;
+  if (y >= tab_bar_y && y <= tab_bar_y + tab_bar_h) {
+    int tab_count = 3;
+    int tab_w = screen_w / tab_count;
+    int tab_index = x / tab_w;
+
+    if (tab_index >= 0 && tab_index < tab_count) {
+      ConfigTab new_tab = (ConfigTab)tab_index;
+      if (new_tab != current_config_tab) {
+        current_config_tab = new_tab;
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Switched to config tab: %s\n", getConfigTabName(current_config_tab));
+        return true;
+      }
+    }
+  }
+
   // Check navigation button
   int nav_button_w = 150;
   int nav_button_h = 50;
@@ -2499,144 +2590,149 @@ bool handleConfigTouch(int x, int y) {
     return true;
   }
 
-  int section_y = 100;
+  // Tab content area calculations (matching showConfigurationPage)
+  int content_y = tab_bar_y + tab_bar_h + 20;
   int section_h = 90;
   int section_spacing = 10;
+  int section_y = content_y;
   int section_w = screen_w - 40;
   int section_x = 20;
 
-  // Check Data Source section
-  if (y >= section_y && y <= section_y + section_h) {
-    config.simulation_mode = !config.simulation_mode;
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Data source changed to: %s\n", config.simulation_mode ? "Simulation" : "Live CAN");
-    return true;
-  }
+  // Handle section touches based on current tab
+  switch (current_config_tab) {
+    case TAB_BASIC:
+      // Data Source section
+      if (y >= section_y && y <= section_y + section_h) {
+        config.simulation_mode = !config.simulation_mode;
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Data source changed to: %s\n", config.simulation_mode ? "Simulation" : "Live CAN");
+        return true;
+      }
+      section_y += section_h + section_spacing;
 
-  section_y += section_h + section_spacing;
+      // Stream Type section
+      if (y >= section_y && y <= section_y + section_h) {
+        config.use_custom_streams = !config.use_custom_streams;
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Stream type changed to: %s\n", config.use_custom_streams ? "Custom Stream" : "Haltech IC7");
+        return true;
+      }
+      section_y += section_h + section_spacing;
 
-  // Check Stream Type section
-  if (y >= section_y && y <= section_y + section_h) {
-    config.use_custom_streams = !config.use_custom_streams;
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Stream type changed to: %s\n", config.use_custom_streams ? "Custom Stream" : "Haltech IC7");
-    return true;
-  }
+      // CAN Speed section
+      if (y >= section_y && y <= section_y + section_h) {
+        // Cycle through CAN speeds
+        switch (config.can_speed) {
+          case 125000: config.can_speed = 250000; break;
+          case 250000: config.can_speed = 500000; break;
+          case 500000: config.can_speed = 1000000; break;
+          case 1000000: config.can_speed = 125000; break;
+          default: config.can_speed = 500000; break;
+        }
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("CAN speed changed to: %d kbps\n", config.can_speed / 1000);
+        return true;
+      }
+      section_y += section_h + section_spacing;
 
-  section_y += section_h + section_spacing;
+      // CAN ID section
+      if (y >= section_y && y <= section_y + section_h) {
+        calculator_mode = true;
+        calculator_value = config.base_can_id;
+        showCANIDCalculator();
+        Serial.println("Opening CAN ID calculator");
+        return true;
+      }
+      section_y += section_h + section_spacing;
 
-  // Check CAN Speed section
-  if (y >= section_y && y <= section_y + section_h) {
-    // Cycle through CAN speeds
-    switch (config.can_speed) {
-      case 125000: config.can_speed = 250000; break;
-      case 250000: config.can_speed = 500000; break;
-      case 500000: config.can_speed = 1000000; break;
-      case 1000000: config.can_speed = 125000; break;
-      default: config.can_speed = 500000; break;
-    }
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("CAN speed changed to: %d kbps\n", config.can_speed / 1000);
-    return true;
-  }
+      // Units section
+      if (y >= section_y && y <= section_y + section_h) {
+        config.units = (config.units == METRIC) ? IMPERIAL : METRIC;
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Units changed to: %s\n", getUnitSystemName());
+        return true;
+      }
+      break;
 
-  section_y += section_h + section_spacing;
+    case TAB_LOGGING:
+      // Log Mode section
+      if (y >= section_y && y <= section_y + section_h) {
+        // Cycle through logging modes
+        switch (config.logging_mode) {
+          case LOG_DISABLED: config.logging_mode = LOG_ERRORS; break;
+          case LOG_ERRORS: config.logging_mode = LOG_CHANGES; break;
+          case LOG_CHANGES: config.logging_mode = LOG_FULL; break;
+          case LOG_FULL: config.logging_mode = LOG_SESSION; break;
+          case LOG_SESSION: config.logging_mode = LOG_DISABLED; break;
+        }
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Logging mode changed to: %s\n", getLoggingModeName());
+        return true;
+      }
+      section_y += section_h + section_spacing;
 
-  // Check CAN ID section
-  if (y >= section_y && y <= section_y + section_h) {
-    calculator_mode = true;
-    calculator_value = config.base_can_id;
-    showCANIDCalculator();
-    Serial.println("Opening CAN ID calculator");
-    return true;
-  }
+      // Log Detail section (only if logging is enabled)
+      if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+        // Cycle through detail levels
+        switch (config.log_detail) {
+          case LOG_BASIC: config.log_detail = LOG_DETAILED; break;
+          case LOG_DETAILED: config.log_detail = LOG_DIAGNOSTIC; break;
+          case LOG_DIAGNOSTIC: config.log_detail = LOG_BASIC; break;
+        }
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Log detail changed to: %s\n", getLogDetailName());
+        return true;
+      }
+      if (isLoggingEnabled()) {
+        section_y += section_h + section_spacing;
+      }
 
-  section_y += section_h + section_spacing;
+      // Buffer Size section (only if logging is enabled)
+      if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+        // Cycle through buffer sizes
+        switch (config.buffer_size) {
+          case BUFFER_SMALL: config.buffer_size = BUFFER_MEDIUM; break;
+          case BUFFER_MEDIUM: config.buffer_size = BUFFER_LARGE; break;
+          case BUFFER_LARGE: config.buffer_size = BUFFER_CUSTOM; break;
+          case BUFFER_CUSTOM: config.buffer_size = BUFFER_SMALL; break;
+        }
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Buffer size changed to: %s (%d frames)\n", getBufferSizeName(), getBufferFrameCount());
+        return true;
+      }
+      if (isLoggingEnabled()) {
+        section_y += section_h + section_spacing;
+      }
 
-  // Check Units section
-  if (y >= section_y && y <= section_y + section_h) {
-    config.units = (config.units == METRIC) ? IMPERIAL : METRIC;
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Units changed to: %s\n", getUnitSystemName());
-    return true;
-  }
+      // Storage section (only if logging is enabled)
+      if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+        // Cycle through file sizes: 1, 5, 10, 50, 100 MB
+        switch (config.max_file_size_mb) {
+          case 1: config.max_file_size_mb = 5; break;
+          case 5: config.max_file_size_mb = 10; break;
+          case 10: config.max_file_size_mb = 50; break;
+          case 50: config.max_file_size_mb = 100; break;
+          case 100: config.max_file_size_mb = 1; break;
+          default: config.max_file_size_mb = 10; break;
+        }
+        saveConfig();
+        showConfigurationPage(); // Refresh display
+        Serial.printf("Storage settings changed to: %dMB x%d files\n", config.max_file_size_mb, config.max_files);
+        return true;
+      }
+      break;
 
-  section_y += section_h + section_spacing;
-
-  // Check Log Mode section
-  if (y >= section_y && y <= section_y + section_h) {
-    // Cycle through logging modes
-    switch (config.logging_mode) {
-      case LOG_DISABLED: config.logging_mode = LOG_ERRORS; break;
-      case LOG_ERRORS: config.logging_mode = LOG_CHANGES; break;
-      case LOG_CHANGES: config.logging_mode = LOG_FULL; break;
-      case LOG_FULL: config.logging_mode = LOG_SESSION; break;
-      case LOG_SESSION: config.logging_mode = LOG_DISABLED; break;
-    }
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Logging mode changed to: %s\n", getLoggingModeName());
-    return true;
-  }
-
-  section_y += section_h + section_spacing;
-
-  // Check Log Detail section (only if logging is enabled)
-  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
-    // Cycle through detail levels
-    switch (config.log_detail) {
-      case LOG_BASIC: config.log_detail = LOG_DETAILED; break;
-      case LOG_DETAILED: config.log_detail = LOG_DIAGNOSTIC; break;
-      case LOG_DIAGNOSTIC: config.log_detail = LOG_BASIC; break;
-    }
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Log detail changed to: %s\n", getLogDetailName());
-    return true;
-  }
-
-  if (isLoggingEnabled()) {
-    section_y += section_h + section_spacing;
-  }
-
-  // Check Buffer Size section (only if logging is enabled)
-  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
-    // Cycle through buffer sizes
-    switch (config.buffer_size) {
-      case BUFFER_SMALL: config.buffer_size = BUFFER_MEDIUM; break;
-      case BUFFER_MEDIUM: config.buffer_size = BUFFER_LARGE; break;
-      case BUFFER_LARGE: config.buffer_size = BUFFER_CUSTOM; break;
-      case BUFFER_CUSTOM: config.buffer_size = BUFFER_SMALL; break;
-    }
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Buffer size changed to: %s (%d frames)\n", getBufferSizeName(), getBufferFrameCount());
-    return true;
-  }
-
-  if (isLoggingEnabled()) {
-    section_y += section_h + section_spacing;
-  }
-
-  // Check Storage section (only if logging is enabled)
-  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
-    // Cycle through file sizes: 1, 5, 10, 50, 100 MB
-    switch (config.max_file_size_mb) {
-      case 1: config.max_file_size_mb = 5; break;
-      case 5: config.max_file_size_mb = 10; break;
-      case 10: config.max_file_size_mb = 50; break;
-      case 50: config.max_file_size_mb = 100; break;
-      case 100: config.max_file_size_mb = 1; break;
-      default: config.max_file_size_mb = 10; break;
-    }
-    saveConfig();
-    showConfigurationPage(); // Refresh display
-    Serial.printf("Storage settings changed to: %dMB x%d files\n", config.max_file_size_mb, config.max_files);
-    return true;
+    case TAB_ADVANCED:
+      // Future advanced settings will be handled here
+      // For now, no interactive sections
+      break;
   }
 
   return false;
