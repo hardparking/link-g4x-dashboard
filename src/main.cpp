@@ -3105,34 +3105,10 @@ void loop() {
   if (!calculator_mode) {
     static unsigned long last_refresh = 0;
 
-    if (current_mode == MODE_CONFIG && millis() - last_refresh > 800) {
-      // Refresh config page blinking indicators
-      int section_y = 100;
-      int section_h = 90;
-      int section_spacing = 10;
-
-      for (int i = 0; i < 4; i++) { // Now 4 sections including CAN ID
-        int y = section_y + i * (section_h + section_spacing);
-        uint16_t accent_color;
-
-        switch (i) {
-          case 0: accent_color = config.simulation_mode ? M5.Display.color565(255, 150, 0) : M5.Display.color565(0, 255, 100); break;
-          case 1: accent_color = config.use_custom_streams ? M5.Display.color565(0, 255, 200) : M5.Display.color565(255, 100, 255); break;
-          case 2: accent_color = M5.Display.color565(255, 255, 0); break;
-          case 3: accent_color = M5.Display.color565(255, 100, 255); break; // CAN ID
-        }
-
-        // Clear and redraw blinking dot (smaller area, faster clear)
-        M5.Display.fillCircle(M5.Display.width() - 45, y + 25, 5, M5.Display.color565(40, 40, 80));
-
-        static bool blink_state = false;
-        if (i == 0) blink_state = !blink_state; // Only toggle once per refresh
-
-        if (blink_state) {
-          M5.Display.fillCircle(M5.Display.width() - 45, y + 25, 4, accent_color);
-        }
-      }
-
+    if (current_mode == MODE_CONFIG && millis() - last_refresh > 500) {
+      // Update global animations and refresh config page
+      updateGlobalAnimations();
+      showConfigurationPage();
       last_refresh = millis();
     } else if (current_mode == MODE_GAUGES && millis() - last_refresh > 100) {
       // Efficient refresh - only update simulation and changed values
