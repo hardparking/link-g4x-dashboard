@@ -67,6 +67,10 @@ Preferences preferences;
 // Configuration tab state
 ConfigTab current_config_tab = TAB_BASIC;
 
+// Global animation system for blinking dots
+unsigned long last_blink_time = 0;
+bool global_blink_state = false;
+
 // ========== UNIT CONVERSION FUNCTIONS ==========
 float convertTemperature(float celsius) {
   if (config.units == IMPERIAL) {
@@ -148,6 +152,15 @@ uint16_t getBufferFrameCount() {
 
 bool isLoggingEnabled() {
   return config.logging_mode != LOG_DISABLED;
+}
+
+// ========== GLOBAL ANIMATION SYSTEM ==========
+void updateGlobalAnimations() {
+  // Update global blink state every 500ms
+  if (millis() - last_blink_time > 500) {
+    global_blink_state = !global_blink_state;
+    last_blink_time = millis();
+  }
 }
 
 // ========== CONFIG TAB FUNCTIONS ==========
@@ -698,6 +711,9 @@ void showConfigurationPage() {
   int screen_w = M5.Display.width();
   int screen_h = M5.Display.height();
 
+  // Update global animations for synchronized blinking
+  updateGlobalAnimations();
+
   // 90's JDM gradient background (dark blue to black with grid pattern)
   for (int y = 0; y < screen_h; y++) {
     uint16_t color = M5.Display.color565(
@@ -938,15 +954,8 @@ void drawJDMConfigSection(const char* title, const char* japanese_title, int y, 
   M5.Display.setTextDatum(textdatum_t::middle_center);
   M5.Display.drawString(value, section_x + section_w - 110, y + 25);
 
-  // Status indicator (animated dot)
-  static unsigned long last_blink = 0;
-  static bool blink_state = false;
-  if (millis() - last_blink > 500) {
-    blink_state = !blink_state;
-    last_blink = millis();
-  }
-
-  if (blink_state) {
+  // Status indicator (animated dot) - properly synchronized
+  if (global_blink_state) {
     M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
   }
 
