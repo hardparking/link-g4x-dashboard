@@ -163,6 +163,8 @@ void updateGlobalAnimations() {
   }
 }
 
+
+
 // ========== CONFIG TAB FUNCTIONS ==========
 const char* getConfigTabName(ConfigTab tab) {
   switch (tab) {
@@ -697,6 +699,90 @@ enum AppMode {
 
 AppMode current_mode = MODE_GAUGES;
 
+// ========== BLINKING DOTS REFRESH FUNCTION ==========
+void refreshConfigBlinkingDots() {
+  if (current_mode != MODE_CONFIG) return;
+
+  // Calculate section positions (matching showConfigurationPage layout)
+  int tab_bar_y = 90;
+  int tab_bar_h = 60;
+  int content_y = tab_bar_y + tab_bar_h + 15;
+  int section_h = 80;
+  int section_spacing = 8;
+  int section_y = content_y;
+
+  int screen_w = M5.Display.width();
+  int section_w = screen_w - 40;
+  int section_x = 20;
+
+  // Draw dots based on current tab
+  switch (current_config_tab) {
+    case TAB_BASIC:
+      // 5 sections in BASIC tab
+      for (int i = 0; i < 5; i++) {
+        int y = section_y + i * (section_h + section_spacing);
+        uint16_t accent_color;
+
+        switch (i) {
+          case 0: accent_color = config.simulation_mode ? M5.Display.color565(255, 150, 0) : M5.Display.color565(0, 255, 100); break;
+          case 1: accent_color = config.use_custom_streams ? M5.Display.color565(0, 255, 200) : M5.Display.color565(255, 100, 255); break;
+          case 2: accent_color = M5.Display.color565(255, 255, 0); break;
+          case 3: accent_color = M5.Display.color565(255, 100, 255); break;
+          case 4: accent_color = config.units == METRIC ? M5.Display.color565(100, 255, 100) : M5.Display.color565(255, 165, 0); break;
+        }
+
+        // Clear dot area and redraw
+        M5.Display.fillCircle(section_x + section_w - 25, y + 25, 5, M5.Display.color565(40, 40, 80));
+        if (global_blink_state) {
+          M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
+        }
+      }
+      break;
+
+    case TAB_LOGGING:
+      {
+        // Variable number of sections based on logging state
+        int logging_sections = 1; // LOG MODE always present
+        if (isLoggingEnabled()) {
+          logging_sections += 3; // LOG DETAIL, BUFFER SIZE, STORAGE
+        }
+
+        for (int i = 0; i < logging_sections; i++) {
+          int y = section_y + i * (section_h + section_spacing);
+          uint16_t accent_color;
+
+          switch (i) {
+            case 0: accent_color = isLoggingEnabled() ? M5.Display.color565(255, 100, 100) : M5.Display.color565(100, 100, 100); break;
+            case 1: accent_color = M5.Display.color565(100, 255, 255); break;
+            case 2: accent_color = M5.Display.color565(255, 255, 100); break;
+            case 3: accent_color = M5.Display.color565(255, 165, 0); break;
+          }
+
+          // Clear dot area and redraw
+          M5.Display.fillCircle(section_x + section_w - 25, y + 25, 5, M5.Display.color565(40, 40, 80));
+          if (global_blink_state) {
+            M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
+          }
+        }
+      }
+      break;
+
+    case TAB_ADVANCED:
+      {
+        // 1 section in ADVANCED tab
+        int y = section_y;
+        uint16_t accent_color = M5.Display.color565(150, 150, 150);
+
+        // Clear dot area and redraw
+        M5.Display.fillCircle(section_x + section_w - 25, y + 25, 5, M5.Display.color565(40, 40, 80));
+        if (global_blink_state) {
+          M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
+        }
+      }
+      break;
+  }
+}
+
 // Control interface presets
 enum ControlPreset {
   PRESET_STREET = 0,
@@ -954,10 +1040,7 @@ void drawJDMConfigSection(const char* title, const char* japanese_title, int y, 
   M5.Display.setTextDatum(textdatum_t::middle_center);
   M5.Display.drawString(value, section_x + section_w - 110, y + 25);
 
-  // Status indicator (animated dot) - properly synchronized
-  if (global_blink_state) {
-    M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
-  }
+  // Status indicator (animated dot) - handled separately by refreshConfigBlinkingDots()
 
   // Decorative elements
   M5.Display.drawLine(section_x + 10, y + 55, section_x + section_w - 10, y + 55, M5.Display.color565(80, 80, 120));
@@ -3106,9 +3189,9 @@ void loop() {
     static unsigned long last_refresh = 0;
 
     if (current_mode == MODE_CONFIG && millis() - last_refresh > 500) {
-      // Update global animations and refresh config page
+      // Update global animations and refresh only blinking dots
       updateGlobalAnimations();
-      showConfigurationPage();
+      refreshConfigBlinkingDots();
       last_refresh = millis();
     } else if (current_mode == MODE_GAUGES && millis() - last_refresh > 100) {
       // Efficient refresh - only update simulation and changed values
