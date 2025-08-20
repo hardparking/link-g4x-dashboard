@@ -782,11 +782,17 @@ void showConfigurationPage() {
     M5.Display.drawString(getConfigTabName(tab), tab_x + tab_w/2, tab_bar_y + tab_bar_h/2);
   }
 
-  // Tab content area
-  int content_y = tab_bar_y + tab_bar_h + 20;
-  int section_h = 90;
-  int section_spacing = 10;
+  // Tab content area - carefully calculated to fit within screen bounds
+  int content_y = tab_bar_y + tab_bar_h + 15;  // Reduced spacing
+  int section_h = 80;  // Match drawJDMConfigSection height
+  int section_spacing = 8;   // Reduced spacing to fit more content
   int section_y = content_y;
+
+  // Calculate available content space
+  int bottom_banner_h = 80;
+  int available_content_h = screen_h - content_y - bottom_banner_h;
+  // Available: 720 - 165 - 80 = 475px
+  // Max sections that fit: 475 / (80 + 8) = 5.4 sections (5 sections comfortably)
 
   // Draw content based on current tab
   switch (current_config_tab) {
@@ -2590,10 +2596,10 @@ bool handleConfigTouch(int x, int y) {
     return true;
   }
 
-  // Tab content area calculations (matching showConfigurationPage)
-  int content_y = tab_bar_y + tab_bar_h + 20;
-  int section_h = 90;
-  int section_spacing = 10;
+  // Tab content area calculations (matching showConfigurationPage exactly)
+  int content_y = tab_bar_y + tab_bar_h + 15;  // Match display function
+  int section_h = 80;   // Match drawJDMConfigSection height
+  int section_spacing = 8;   // Match display function spacing
   int section_y = content_y;
   int section_w = screen_w - 40;
   int section_x = 20;
