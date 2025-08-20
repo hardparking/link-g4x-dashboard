@@ -44,21 +44,12 @@ struct Config {
   bool use_custom_streams = true;       // Use custom stream configuration
   UnitSystem units = METRIC;            // Unit system (metric/imperial)
 
-  // CAN Logging Configuration
+  // CAN Logging Configuration (UI only - actual logging not implemented)
   LoggingMode logging_mode = LOG_DISABLED;     // Logging mode
   LogDetail log_detail = LOG_BASIC;            // Detail level
   BufferSize buffer_size = BUFFER_MEDIUM;      // Buffer size
-  uint16_t write_frequency_ms = 500;           // Write frequency (ms)
   uint16_t max_file_size_mb = 10;              // Max file size (MB)
   uint8_t max_files = 10;                      // Max number of files
-  uint8_t auto_delete_days = 30;               // Auto delete after days (0=disabled)
-  bool compression_enabled = false;            // Enable compression
-  float change_threshold = 1.0;               // Change threshold for LOG_CHANGES mode (%)
-
-  // Legacy individual unit flags (for backward compatibility)
-  bool use_fahrenheit = false;          // Temperature units
-  bool use_psi = false;                 // Pressure units
-  bool use_mph = false;                 // Speed units
 };
 
 Config config;
@@ -187,9 +178,8 @@ const char* getConfigTabSubtitle(ConfigTab tab) {
 // ========== CAN BUS CONFIGURATION ==========
 // Custom Stream Configuration
 const uint32_t CUSTOM_STREAM_ID_1 = 0x500;  // Primary Engine Data
-const uint32_t CUSTOM_STREAM_ID_2 = 0x501;  // Lambda & Fuel Data  
+const uint32_t CUSTOM_STREAM_ID_2 = 0x501;  // Lambda & Fuel Data
 const uint32_t CUSTOM_STREAM_ID_3 = 0x502;  // Pressures & Status
-const uint32_t CONTROL_STREAM_ID = 0x600;   // Dashboard Commands
 
 unsigned long last_can_message = 0;
 
@@ -221,13 +211,10 @@ struct ECUData {
   bool launch_control_active = false;
   bool anti_lag_active = false;
 
-  // Additional control interface variables
+  // Control interface variables
   float boost_adjustment = 0.0;
   int launch_rpm = 4000;
   bool system_ready = true;
-  bool safe_mode_active = false;
-  uint8_t boost_target_percent = 100;
-  bool ethrottle_control_active = false;
 };
 
 ECUData ecu_data;
@@ -390,26 +377,12 @@ void loadConfig() {
   // Load unit system (new unified approach)
   config.units = (UnitSystem)preferences.getUChar("units", METRIC);
 
-  // Load CAN logging configuration
+  // Load CAN logging configuration (UI only)
   config.logging_mode = (LoggingMode)preferences.getUChar("log_mode", LOG_DISABLED);
   config.log_detail = (LogDetail)preferences.getUChar("log_detail", LOG_BASIC);
   config.buffer_size = (BufferSize)preferences.getUChar("buffer_size", BUFFER_MEDIUM);
-  config.write_frequency_ms = preferences.getUShort("write_freq", 500);
   config.max_file_size_mb = preferences.getUShort("max_file_mb", 10);
   config.max_files = preferences.getUChar("max_files", 10);
-  config.auto_delete_days = preferences.getUChar("auto_del_days", 30);
-  config.compression_enabled = preferences.getBool("compression", false);
-  config.change_threshold = preferences.getFloat("change_thresh", 1.0);
-
-  // Load legacy individual unit flags for backward compatibility
-  config.use_fahrenheit = preferences.getBool("fahrenheit", false);
-  config.use_psi = preferences.getBool("psi", false);
-  config.use_mph = preferences.getBool("mph", false);
-
-  // If legacy flags are set, convert to new unit system
-  if (config.use_fahrenheit || config.use_psi || config.use_mph) {
-    config.units = IMPERIAL;
-  }
 
   preferences.end();
 
@@ -434,86 +407,19 @@ void saveConfig() {
   // Save new unit system
   preferences.putUChar("units", config.units);
 
-  // Save CAN logging configuration
+  // Save CAN logging configuration (UI only)
   preferences.putUChar("log_mode", config.logging_mode);
   preferences.putUChar("log_detail", config.log_detail);
   preferences.putUChar("buffer_size", config.buffer_size);
-  preferences.putUShort("write_freq", config.write_frequency_ms);
   preferences.putUShort("max_file_mb", config.max_file_size_mb);
   preferences.putUChar("max_files", config.max_files);
-  preferences.putUChar("auto_del_days", config.auto_delete_days);
-  preferences.putBool("compression", config.compression_enabled);
-  preferences.putFloat("change_thresh", config.change_threshold);
-
-  // Update legacy flags for backward compatibility
-  config.use_fahrenheit = (config.units == IMPERIAL);
-  config.use_psi = (config.units == IMPERIAL);
-  config.use_mph = (config.units == IMPERIAL);
-
-  preferences.putBool("fahrenheit", config.use_fahrenheit);
-  preferences.putBool("psi", config.use_psi);
-  preferences.putBool("mph", config.use_mph);
 
   preferences.end();
   Serial.printf("Configuration saved - Units: %s\n", getUnitSystemName());
 }
 
 // ========== ANIME SPLASH SCREEN ==========
-void playJapaneseVoice() {
-  // Japanese female voice: "Ready to go?" (Junbi wa ii desu ka?)
-  // Using M5 Speaker with tone synthesis for Japanese pronunciation
 
-  Serial.println("🎵 Playing Japanese voice: 'Junbi wa ii desu ka?'");
-
-  // Test speaker first
-  M5.Speaker.tone(1000, 100);
-  delay(150);
-
-  // "Jun" - ジュン (high-mid tone, more pronounced)
-  M5.Speaker.tone(880, 250);  // A5 - longer duration
-  delay(280);
-  M5.Speaker.tone(660, 200);  // E5
-  delay(230);
-
-  // "bi" - ビ (mid tone, sharper)
-  M5.Speaker.tone(740, 220);  // F#5
-  delay(250);
-
-  // Short pause between words
-  delay(100);
-
-  // "wa" - ワ (mid-low tone, softer)
-  M5.Speaker.tone(587, 250);  // D5
-  delay(280);
-
-  // "ii" - イイ (rising tone, more dramatic)
-  M5.Speaker.tone(523, 200);  // C5
-  delay(230);
-  M5.Speaker.tone(659, 250);  // E5
-  delay(280);
-
-  // Short pause
-  delay(150);
-
-  // "desu" - デス (falling tone, clear pronunciation)
-  M5.Speaker.tone(698, 220);  // F5
-  delay(250);
-  M5.Speaker.tone(523, 200);  // C5
-  delay(230);
-
-  // "ka?" - カ？ (questioning rise, very pronounced)
-  M5.Speaker.tone(659, 250);  // E5
-  delay(280);
-  M5.Speaker.tone(784, 400);  // G5 (questioning rise, longer)
-  delay(450);
-
-  // Cute ending chime
-  M5.Speaker.tone(1047, 150); // C6 - high cute note
-  delay(200);
-
-  M5.Speaker.stop();
-  Serial.println("🎵 Voice playback complete");
-}
 
 void animateLoadingBar(int progress_percent) {
   int screen_w = M5.Display.width();
@@ -2637,9 +2543,7 @@ void setup() {
         Serial.println("Starting in simulation mode");
       }
     } else if (progress == 90) {
-      // Voice playback disabled for testing
-      // playJapaneseVoice();
-      Serial.println("Voice playback skipped (testing mode)");
+      Serial.println("Initialization complete");
     }
 
     delay(50); // Smooth animation timing
