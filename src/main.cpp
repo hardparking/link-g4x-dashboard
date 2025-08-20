@@ -10,12 +10,44 @@ enum UnitSystem {
   IMPERIAL = 1   // Fahrenheit, PSI, mph
 };
 
+enum LoggingMode {
+  LOG_DISABLED = 0,     // No logging
+  LOG_ERRORS = 1,       // Only CAN errors and faults
+  LOG_CHANGES = 2,      // Only when parameters change
+  LOG_FULL = 3,         // All CAN frames
+  LOG_SESSION = 4       // Manual session recording
+};
+
+enum LogDetail {
+  LOG_BASIC = 0,        // Timestamp, CAN ID, values
+  LOG_DETAILED = 1,     // + Frame info, error counters
+  LOG_DIAGNOSTIC = 2    // + Raw hex, timing analysis
+};
+
+enum BufferSize {
+  BUFFER_SMALL = 0,     // 500 frames (~10KB)
+  BUFFER_MEDIUM = 1,    // 1000 frames (~20KB)
+  BUFFER_LARGE = 2,     // 2000 frames (~40KB)
+  BUFFER_CUSTOM = 3     // User defined
+};
+
 struct Config {
   uint32_t base_can_id = 864;           // Base CAN ID for Haltech IC7
   uint32_t can_speed = 500000;          // CAN bus speed (500 kbps)
   bool simulation_mode = true;          // Start in simulation mode
   bool use_custom_streams = true;       // Use custom stream configuration
   UnitSystem units = METRIC;            // Unit system (metric/imperial)
+
+  // CAN Logging Configuration
+  LoggingMode logging_mode = LOG_DISABLED;     // Logging mode
+  LogDetail log_detail = LOG_BASIC;            // Detail level
+  BufferSize buffer_size = BUFFER_MEDIUM;      // Buffer size
+  uint16_t write_frequency_ms = 500;           // Write frequency (ms)
+  uint16_t max_file_size_mb = 10;              // Max file size (MB)
+  uint8_t max_files = 10;                      // Max number of files
+  uint8_t auto_delete_days = 30;               // Auto delete after days (0=disabled)
+  bool compression_enabled = false;            // Enable compression
+  float change_threshold = 1.0;               // Change threshold for LOG_CHANGES mode (%)
 
   // Legacy individual unit flags (for backward compatibility)
   bool use_fahrenheit = false;          // Temperature units
@@ -62,6 +94,51 @@ const char* getSpeedUnit() {
 
 const char* getUnitSystemName() {
   return (config.units == IMPERIAL) ? "IMPERIAL" : "METRIC";
+}
+
+// ========== LOGGING CONFIGURATION FUNCTIONS ==========
+const char* getLoggingModeName() {
+  switch (config.logging_mode) {
+    case LOG_DISABLED: return "DISABLED";
+    case LOG_ERRORS: return "ERRORS";
+    case LOG_CHANGES: return "CHANGES";
+    case LOG_FULL: return "FULL";
+    case LOG_SESSION: return "SESSION";
+    default: return "DISABLED";
+  }
+}
+
+const char* getLogDetailName() {
+  switch (config.log_detail) {
+    case LOG_BASIC: return "BASIC";
+    case LOG_DETAILED: return "DETAILED";
+    case LOG_DIAGNOSTIC: return "DIAGNOSTIC";
+    default: return "BASIC";
+  }
+}
+
+const char* getBufferSizeName() {
+  switch (config.buffer_size) {
+    case BUFFER_SMALL: return "SMALL";
+    case BUFFER_MEDIUM: return "MEDIUM";
+    case BUFFER_LARGE: return "LARGE";
+    case BUFFER_CUSTOM: return "CUSTOM";
+    default: return "MEDIUM";
+  }
+}
+
+uint16_t getBufferFrameCount() {
+  switch (config.buffer_size) {
+    case BUFFER_SMALL: return 500;
+    case BUFFER_MEDIUM: return 1000;
+    case BUFFER_LARGE: return 2000;
+    case BUFFER_CUSTOM: return 1500; // Default custom value
+    default: return 1000;
+  }
+}
+
+bool isLoggingEnabled() {
+  return config.logging_mode != LOG_DISABLED;
 }
 
 // ========== CAN BUS CONFIGURATION ==========
@@ -270,6 +347,17 @@ void loadConfig() {
   // Load unit system (new unified approach)
   config.units = (UnitSystem)preferences.getUChar("units", METRIC);
 
+  // Load CAN logging configuration
+  config.logging_mode = (LoggingMode)preferences.getUChar("log_mode", LOG_DISABLED);
+  config.log_detail = (LogDetail)preferences.getUChar("log_detail", LOG_BASIC);
+  config.buffer_size = (BufferSize)preferences.getUChar("buffer_size", BUFFER_MEDIUM);
+  config.write_frequency_ms = preferences.getUShort("write_freq", 500);
+  config.max_file_size_mb = preferences.getUShort("max_file_mb", 10);
+  config.max_files = preferences.getUChar("max_files", 10);
+  config.auto_delete_days = preferences.getUChar("auto_del_days", 30);
+  config.compression_enabled = preferences.getBool("compression", false);
+  config.change_threshold = preferences.getFloat("change_thresh", 1.0);
+
   // Load legacy individual unit flags for backward compatibility
   config.use_fahrenheit = preferences.getBool("fahrenheit", false);
   config.use_psi = preferences.getBool("psi", false);
@@ -288,6 +376,8 @@ void loadConfig() {
   Serial.printf("  Simulation: %s\n", config.simulation_mode ? "ON" : "OFF");
   Serial.printf("  Custom Streams: %s\n", config.use_custom_streams ? "ON" : "OFF");
   Serial.printf("  Units: %s\n", getUnitSystemName());
+  Serial.printf("  Logging: %s (%s)\n", getLoggingModeName(), getLogDetailName());
+  Serial.printf("  Buffer: %s (%d frames)\n", getBufferSizeName(), getBufferFrameCount());
 }
 
 void saveConfig() {
@@ -300,6 +390,17 @@ void saveConfig() {
 
   // Save new unit system
   preferences.putUChar("units", config.units);
+
+  // Save CAN logging configuration
+  preferences.putUChar("log_mode", config.logging_mode);
+  preferences.putUChar("log_detail", config.log_detail);
+  preferences.putUChar("buffer_size", config.buffer_size);
+  preferences.putUShort("write_freq", config.write_frequency_ms);
+  preferences.putUShort("max_file_mb", config.max_file_size_mb);
+  preferences.putUChar("max_files", config.max_files);
+  preferences.putUChar("auto_del_days", config.auto_delete_days);
+  preferences.putBool("compression", config.compression_enabled);
+  preferences.putFloat("change_thresh", config.change_threshold);
 
   // Update legacy flags for backward compatibility
   config.use_fahrenheit = (config.units == IMPERIAL);
@@ -650,6 +751,40 @@ void showConfigurationPage() {
   // Units Section
   drawJDMConfigSection("UNITS", "単位", section_y, getUnitSystemName(),
                       config.units == METRIC ? M5.Display.color565(100, 255, 100) : M5.Display.color565(255, 165, 0));
+
+  section_y += section_h + section_spacing;
+
+  // CAN Logging Mode Section
+  drawJDMConfigSection("LOG MODE", "ログモード", section_y, getLoggingModeName(),
+                      isLoggingEnabled() ? M5.Display.color565(255, 100, 100) : M5.Display.color565(100, 100, 100));
+
+  section_y += section_h + section_spacing;
+
+  // Log Detail Section (only show if logging is enabled)
+  if (isLoggingEnabled()) {
+    drawJDMConfigSection("LOG DETAIL", "ログ詳細", section_y, getLogDetailName(),
+                        M5.Display.color565(100, 255, 255));
+
+    section_y += section_h + section_spacing;
+  }
+
+  // Buffer Size Section (only show if logging is enabled)
+  if (isLoggingEnabled()) {
+    char buffer_text[30];
+    sprintf(buffer_text, "%s (%d)", getBufferSizeName(), getBufferFrameCount());
+    drawJDMConfigSection("BUFFER SIZE", "バッファサイズ", section_y, buffer_text,
+                        M5.Display.color565(255, 255, 100));
+
+    section_y += section_h + section_spacing;
+  }
+
+  // Storage Settings Section (only show if logging is enabled)
+  if (isLoggingEnabled()) {
+    char storage_text[30];
+    sprintf(storage_text, "%dMB x%d", config.max_file_size_mb, config.max_files);
+    drawJDMConfigSection("STORAGE", "ストレージ", section_y, storage_text,
+                        M5.Display.color565(255, 165, 0));
+  }
 
   // Bottom navigation bar with retro styling
   M5.Display.fillRect(0, screen_h - 80, screen_w, 80, M5.Display.color565(30, 30, 30));
@@ -2427,6 +2562,80 @@ bool handleConfigTouch(int x, int y) {
     saveConfig();
     showConfigurationPage(); // Refresh display
     Serial.printf("Units changed to: %s\n", getUnitSystemName());
+    return true;
+  }
+
+  section_y += section_h + section_spacing;
+
+  // Check Log Mode section
+  if (y >= section_y && y <= section_y + section_h) {
+    // Cycle through logging modes
+    switch (config.logging_mode) {
+      case LOG_DISABLED: config.logging_mode = LOG_ERRORS; break;
+      case LOG_ERRORS: config.logging_mode = LOG_CHANGES; break;
+      case LOG_CHANGES: config.logging_mode = LOG_FULL; break;
+      case LOG_FULL: config.logging_mode = LOG_SESSION; break;
+      case LOG_SESSION: config.logging_mode = LOG_DISABLED; break;
+    }
+    saveConfig();
+    showConfigurationPage(); // Refresh display
+    Serial.printf("Logging mode changed to: %s\n", getLoggingModeName());
+    return true;
+  }
+
+  section_y += section_h + section_spacing;
+
+  // Check Log Detail section (only if logging is enabled)
+  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+    // Cycle through detail levels
+    switch (config.log_detail) {
+      case LOG_BASIC: config.log_detail = LOG_DETAILED; break;
+      case LOG_DETAILED: config.log_detail = LOG_DIAGNOSTIC; break;
+      case LOG_DIAGNOSTIC: config.log_detail = LOG_BASIC; break;
+    }
+    saveConfig();
+    showConfigurationPage(); // Refresh display
+    Serial.printf("Log detail changed to: %s\n", getLogDetailName());
+    return true;
+  }
+
+  if (isLoggingEnabled()) {
+    section_y += section_h + section_spacing;
+  }
+
+  // Check Buffer Size section (only if logging is enabled)
+  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+    // Cycle through buffer sizes
+    switch (config.buffer_size) {
+      case BUFFER_SMALL: config.buffer_size = BUFFER_MEDIUM; break;
+      case BUFFER_MEDIUM: config.buffer_size = BUFFER_LARGE; break;
+      case BUFFER_LARGE: config.buffer_size = BUFFER_CUSTOM; break;
+      case BUFFER_CUSTOM: config.buffer_size = BUFFER_SMALL; break;
+    }
+    saveConfig();
+    showConfigurationPage(); // Refresh display
+    Serial.printf("Buffer size changed to: %s (%d frames)\n", getBufferSizeName(), getBufferFrameCount());
+    return true;
+  }
+
+  if (isLoggingEnabled()) {
+    section_y += section_h + section_spacing;
+  }
+
+  // Check Storage section (only if logging is enabled)
+  if (isLoggingEnabled() && y >= section_y && y <= section_y + section_h) {
+    // Cycle through file sizes: 1, 5, 10, 50, 100 MB
+    switch (config.max_file_size_mb) {
+      case 1: config.max_file_size_mb = 5; break;
+      case 5: config.max_file_size_mb = 10; break;
+      case 10: config.max_file_size_mb = 50; break;
+      case 50: config.max_file_size_mb = 100; break;
+      case 100: config.max_file_size_mb = 1; break;
+      default: config.max_file_size_mb = 10; break;
+    }
+    saveConfig();
+    showConfigurationPage(); // Refresh display
+    Serial.printf("Storage settings changed to: %dMB x%d files\n", config.max_file_size_mb, config.max_files);
     return true;
   }
 
