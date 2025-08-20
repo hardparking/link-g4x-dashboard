@@ -5,11 +5,19 @@
 #include <Preferences.h>
 
 // ========== CONFIGURATION ==========
+enum UnitSystem {
+  METRIC = 0,    // Celsius, kPa, km/h
+  IMPERIAL = 1   // Fahrenheit, PSI, mph
+};
+
 struct Config {
   uint32_t base_can_id = 864;           // Base CAN ID for Haltech IC7
   uint32_t can_speed = 500000;          // CAN bus speed (500 kbps)
   bool simulation_mode = true;          // Start in simulation mode
   bool use_custom_streams = true;       // Use custom stream configuration
+  UnitSystem units = METRIC;            // Unit system (metric/imperial)
+
+  // Legacy individual unit flags (for backward compatibility)
   bool use_fahrenheit = false;          // Temperature units
   bool use_psi = false;                 // Pressure units
   bool use_mph = false;                 // Speed units
@@ -17,6 +25,44 @@ struct Config {
 
 Config config;
 Preferences preferences;
+
+// ========== UNIT CONVERSION FUNCTIONS ==========
+float convertTemperature(float celsius) {
+  if (config.units == IMPERIAL) {
+    return celsius * 9.0f / 5.0f + 32.0f; // Convert to Fahrenheit
+  }
+  return celsius; // Return Celsius
+}
+
+float convertPressure(float kpa) {
+  if (config.units == IMPERIAL) {
+    return kpa * 0.145038f; // Convert to PSI
+  }
+  return kpa; // Return kPa
+}
+
+float convertSpeed(float kmh) {
+  if (config.units == IMPERIAL) {
+    return kmh * 0.621371f; // Convert to mph
+  }
+  return kmh; // Return km/h
+}
+
+const char* getTemperatureUnit() {
+  return (config.units == IMPERIAL) ? "°F" : "°C";
+}
+
+const char* getPressureUnit() {
+  return (config.units == IMPERIAL) ? "PSI" : "KPA";
+}
+
+const char* getSpeedUnit() {
+  return (config.units == IMPERIAL) ? "MPH" : "KM/H";
+}
+
+const char* getUnitSystemName() {
+  return (config.units == IMPERIAL) ? "IMPERIAL" : "METRIC";
+}
 
 // ========== CAN BUS CONFIGURATION ==========
 // Custom Stream Configuration
@@ -215,37 +261,57 @@ void simulateData() {
 // ========== CONFIGURATION ==========
 void loadConfig() {
   preferences.begin("link_g4x", false);
-  
+
   config.base_can_id = preferences.getUInt("base_can_id", 864);
   config.can_speed = preferences.getUInt("can_speed", 500000);
   config.simulation_mode = preferences.getBool("simulation", true);
   config.use_custom_streams = preferences.getBool("custom_streams", true);
+
+  // Load unit system (new unified approach)
+  config.units = (UnitSystem)preferences.getUChar("units", METRIC);
+
+  // Load legacy individual unit flags for backward compatibility
   config.use_fahrenheit = preferences.getBool("fahrenheit", false);
   config.use_psi = preferences.getBool("psi", false);
   config.use_mph = preferences.getBool("mph", false);
-  
+
+  // If legacy flags are set, convert to new unit system
+  if (config.use_fahrenheit || config.use_psi || config.use_mph) {
+    config.units = IMPERIAL;
+  }
+
   preferences.end();
-  
+
   Serial.println("Configuration loaded:");
   Serial.printf("  Base CAN ID: %d\n", config.base_can_id);
   Serial.printf("  CAN Speed: %d bps\n", config.can_speed);
   Serial.printf("  Simulation: %s\n", config.simulation_mode ? "ON" : "OFF");
   Serial.printf("  Custom Streams: %s\n", config.use_custom_streams ? "ON" : "OFF");
+  Serial.printf("  Units: %s\n", getUnitSystemName());
 }
 
 void saveConfig() {
   preferences.begin("link_g4x", false);
-  
+
   preferences.putUInt("base_can_id", config.base_can_id);
   preferences.putUInt("can_speed", config.can_speed);
   preferences.putBool("simulation", config.simulation_mode);
   preferences.putBool("custom_streams", config.use_custom_streams);
+
+  // Save new unit system
+  preferences.putUChar("units", config.units);
+
+  // Update legacy flags for backward compatibility
+  config.use_fahrenheit = (config.units == IMPERIAL);
+  config.use_psi = (config.units == IMPERIAL);
+  config.use_mph = (config.units == IMPERIAL);
+
   preferences.putBool("fahrenheit", config.use_fahrenheit);
   preferences.putBool("psi", config.use_psi);
   preferences.putBool("mph", config.use_mph);
-  
+
   preferences.end();
-  Serial.println("Configuration saved");
+  Serial.printf("Configuration saved - Units: %s\n", getUnitSystemName());
 }
 
 // ========== ANIME SPLASH SCREEN ==========
@@ -578,6 +644,12 @@ void showConfigurationPage() {
   char can_id_text[20];
   sprintf(can_id_text, "%d", config.base_can_id);
   drawJDMConfigSection("CAN BASE ID", "CAN ID", section_y, can_id_text, M5.Display.color565(255, 100, 255));
+
+  section_y += section_h + section_spacing;
+
+  // Units Section
+  drawJDMConfigSection("UNITS", "単位", section_y, getUnitSystemName(),
+                      config.units == METRIC ? M5.Display.color565(100, 255, 100) : M5.Display.color565(255, 165, 0));
 
   // Bottom navigation bar with retro styling
   M5.Display.fillRect(0, screen_h - 80, screen_w, 80, M5.Display.color565(30, 30, 30));
@@ -1731,13 +1803,13 @@ void showGaugesPage() {
                     "TPS", "%", M5.Display.color565(100, 255, 100), 3);
 
     drawGaugeStatic(gauge_positions[3].x, gauge_positions[3].y, gauge_positions[3].w, gauge_positions[3].h,
-                    "BOOST", "PSI", M5.Display.color565(255, 165, 0), 3);
+                    "BOOST", getPressureUnit(), M5.Display.color565(255, 165, 0), 3);
 
     drawGaugeStatic(gauge_positions[4].x, gauge_positions[4].y, gauge_positions[4].w, gauge_positions[4].h,
-                    "IAT", "°C", M5.Display.color565(100, 150, 255), 3);
+                    "IAT", getTemperatureUnit(), M5.Display.color565(100, 150, 255), 3);
 
     drawGaugeStatic(gauge_positions[5].x, gauge_positions[5].y, gauge_positions[5].w, gauge_positions[5].h,
-                    "ECT", "°C", M5.Display.color565(255, 100, 255), 3);
+                    "ECT", getTemperatureUnit(), M5.Display.color565(255, 100, 255), 3);
 
     drawGaugeStatic(gauge_positions[6].x, gauge_positions[6].y, gauge_positions[6].w, gauge_positions[6].h,
                     "OIL PRESS", "BAR", M5.Display.color565(255, 200, 100), 2);
@@ -1793,9 +1865,9 @@ void showGaugesPage() {
 
   sprintf(rpm_str, "%.0f", sim_rpm);
   sprintf(tps_str, "%.1f", sim_tps);
-  sprintf(boost_str, "%.1f", sim_boost);
-  sprintf(iat_str, "%.0f", sim_iat);
-  sprintf(ect_str, "%.0f", sim_ect);
+  sprintf(boost_str, "%.1f", convertPressure(sim_boost));
+  sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
+  sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
   sprintf(oil_press_str, "%.1f", sim_oil_press);
   sprintf(fuel_press_str, "%.1f", sim_fuel_press);
   sprintf(battery_str, "%.1f", sim_battery);
@@ -1804,9 +1876,9 @@ void showGaugesPage() {
 
   sprintf(last_rpm_str, "%.0f", last_sim_rpm);
   sprintf(last_tps_str, "%.1f", last_sim_tps);
-  sprintf(last_boost_str, "%.1f", last_sim_boost);
-  sprintf(last_iat_str, "%.0f", last_sim_iat);
-  sprintf(last_ect_str, "%.0f", last_sim_ect);
+  sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
+  sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
+  sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
   sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
   sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
   sprintf(last_battery_str, "%.1f", last_sim_battery);
@@ -1959,7 +2031,7 @@ void drawBoostMapSelector(int x, int y, int w, int h) {
   M5.Display.setTextColor(TFT_WHITE);
   M5.Display.setTextDatum(textdatum_t::bottom_center);
   char boost_str[20];
-  sprintf(boost_str, "%.1f PSI", sim_boost);
+  sprintf(boost_str, "%.1f %s", convertPressure(sim_boost), getPressureUnit());
   M5.Display.drawString(boost_str, x + w/2, y + h - 15);
 }
 
@@ -2004,8 +2076,8 @@ void drawBoostAdjustment(int x, int y, int w, int h) {
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(M5.Display.color565(200, 200, 200));
   M5.Display.setTextDatum(textdatum_t::bottom_center);
-  char target_str[20];
-  sprintf(target_str, "Target: %.1f PSI", sim_boost + ecu_data.boost_adjustment);
+  char target_str[30];
+  sprintf(target_str, "Target: %.1f %s", convertPressure(sim_boost + ecu_data.boost_adjustment), getPressureUnit());
   M5.Display.drawString(target_str, x + w/2, y + h - 15);
 }
 
@@ -2137,8 +2209,8 @@ void showControlPage() {
 
   // Boost Display (3rd control)
   char boost_current[15], boost_target[15];
-  sprintf(boost_current, "%.1f PSI", sim_boost);
-  sprintf(boost_target, "%.1f PSI", sim_boost + ecu_data.boost_adjustment);
+  sprintf(boost_current, "%.1f %s", convertPressure(sim_boost), getPressureUnit());
+  sprintf(boost_target, "%.1f %s", convertPressure(sim_boost + ecu_data.boost_adjustment), getPressureUnit());
   drawControlButton(side_margin + 2*(top_control_w + gap), top_y, top_control_w, row_height,
                     "BOOST DISPLAY", boost_current, ecu_data.boost_control_active,
                     M5.Display.color565(255, 165, 0));
@@ -2344,6 +2416,17 @@ bool handleConfigTouch(int x, int y) {
     calculator_value = config.base_can_id;
     showCANIDCalculator();
     Serial.println("Opening CAN ID calculator");
+    return true;
+  }
+
+  section_y += section_h + section_spacing;
+
+  // Check Units section
+  if (y >= section_y && y <= section_y + section_h) {
+    config.units = (config.units == METRIC) ? IMPERIAL : METRIC;
+    saveConfig();
+    showConfigurationPage(); // Refresh display
+    Serial.printf("Units changed to: %s\n", getUnitSystemName());
     return true;
   }
 
@@ -2745,9 +2828,9 @@ void loop() {
 
         sprintf(rpm_str, "%.0f", sim_rpm);
         sprintf(tps_str, "%.1f", sim_tps);
-        sprintf(boost_str, "%.1f", sim_boost);
-        sprintf(iat_str, "%.0f", sim_iat);
-        sprintf(ect_str, "%.0f", sim_ect);
+        sprintf(boost_str, "%.1f", convertPressure(sim_boost));
+        sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
+        sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
         sprintf(oil_press_str, "%.1f", sim_oil_press);
         sprintf(fuel_press_str, "%.1f", sim_fuel_press);
         sprintf(battery_str, "%.1f", sim_battery);
@@ -2756,9 +2839,9 @@ void loop() {
 
         sprintf(last_rpm_str, "%.0f", last_sim_rpm);
         sprintf(last_tps_str, "%.1f", last_sim_tps);
-        sprintf(last_boost_str, "%.1f", last_sim_boost);
-        sprintf(last_iat_str, "%.0f", last_sim_iat);
-        sprintf(last_ect_str, "%.0f", last_sim_ect);
+        sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
+        sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
+        sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
         sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
         sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
         sprintf(last_battery_str, "%.1f", last_sim_battery);
