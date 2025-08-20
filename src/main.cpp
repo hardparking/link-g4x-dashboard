@@ -487,7 +487,7 @@ enum AppMode {
   MODE_CONTROL
 };
 
-AppMode current_mode = MODE_CONFIG;
+AppMode current_mode = MODE_GAUGES;
 
 // Control interface presets
 enum ControlPreset {
@@ -2270,8 +2270,8 @@ void setup() {
 
   delay(1000); // Hold at 100% for a moment
 
-  // Show configuration page after splash
-  showConfigurationPage();
+  // Show gauges page after splash (start directly in gauge mode)
+  showGaugesPage();
 
   Serial.println("=== SYSTEM READY ===");
 }
