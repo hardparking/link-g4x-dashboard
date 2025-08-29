@@ -34,12 +34,12 @@ enum BufferSize {
 enum ConfigTab {
   TAB_BASIC = 0,        // Basic settings (CAN, Units, Simulation)
   TAB_LOGGING = 1,      // Logging configuration
-  TAB_ADVANCED = 2      // Advanced settings (future)
+  TAB_CAN_MONITOR = 2   // Real-time CAN monitoring
 };
 
 struct Config {
   uint32_t base_can_id = 864;           // Base CAN ID for Haltech IC7
-  uint32_t can_speed = 500000;          // CAN bus speed (500 kbps)
+  uint32_t can_speed = 1000000;         // CAN bus speed (1000 kbps / 1 Mbps)
   bool simulation_mode = true;          // Start in simulation mode
   bool use_custom_streams = true;       // Use custom stream configuration
   UnitSystem units = METRIC;            // Unit system (metric/imperial)
@@ -100,6 +100,16 @@ const char* getUnitSystemName() {
   return (config.units == IMPERIAL) ? "IMPERIAL" : "METRIC";
 }
 
+const char* getCANSpeedName() {
+  switch (config.can_speed) {
+    case 125000: return "125 KBPS";
+    case 250000: return "250 KBPS";
+    case 500000: return "500 KBPS";
+    case 1000000: return "1000 KBPS";
+    default: return "UNKNOWN";
+  }
+}
+
 // ========== LOGGING CONFIGURATION FUNCTIONS ==========
 const char* getLoggingModeName() {
   switch (config.logging_mode) {
@@ -145,6 +155,83 @@ bool isLoggingEnabled() {
   return config.logging_mode != LOG_DISABLED;
 }
 
+// ========== CAN MONITORING SYSTEM ==========
+struct CANFrameStats {
+  uint32_t can_id;
+  uint32_t packet_count;
+  uint32_t last_seen;
+  uint8_t data_length;
+  uint8_t last_data[8];
+  bool active;
+};
+
+#define MAX_MONITORED_FRAMES 10
+CANFrameStats can_frame_stats[MAX_MONITORED_FRAMES];
+uint32_t total_can_frames = 0;
+uint32_t can_errors = 0;
+uint32_t last_can_stats_reset = 0;
+
+// ========== CAN MONITORING FUNCTIONS ==========
+void initCANMonitoring() {
+  for (int i = 0; i < MAX_MONITORED_FRAMES; i++) {
+    can_frame_stats[i].can_id = 0;
+    can_frame_stats[i].packet_count = 0;
+    can_frame_stats[i].last_seen = 0;
+    can_frame_stats[i].data_length = 0;
+    can_frame_stats[i].active = false;
+    memset(can_frame_stats[i].last_data, 0, 8);
+  }
+  total_can_frames = 0;
+  can_errors = 0;
+  last_can_stats_reset = millis();
+}
+
+void updateCANStats(uint32_t can_id, const uint8_t* data, uint8_t length) {
+  total_can_frames++;
+
+  // Find existing frame or create new entry
+  int frame_index = -1;
+  for (int i = 0; i < MAX_MONITORED_FRAMES; i++) {
+    if (can_frame_stats[i].active && can_frame_stats[i].can_id == can_id) {
+      frame_index = i;
+      break;
+    }
+  }
+
+  // If not found, find empty slot
+  if (frame_index == -1) {
+    for (int i = 0; i < MAX_MONITORED_FRAMES; i++) {
+      if (!can_frame_stats[i].active) {
+        frame_index = i;
+        can_frame_stats[i].can_id = can_id;
+        can_frame_stats[i].active = true;
+        can_frame_stats[i].packet_count = 0;
+        break;
+      }
+    }
+  }
+
+  // Update stats if we have a valid index
+  if (frame_index >= 0) {
+    can_frame_stats[frame_index].packet_count++;
+    can_frame_stats[frame_index].last_seen = millis();
+    can_frame_stats[frame_index].data_length = length;
+    memcpy(can_frame_stats[frame_index].last_data, data, (length < 8) ? length : 8);
+  }
+}
+
+void resetCANStats() {
+  initCANMonitoring();
+}
+
+int countActiveFrames() {
+  int count = 0;
+  for (int i = 0; i < MAX_MONITORED_FRAMES; i++) {
+    if (can_frame_stats[i].active) count++;
+  }
+  return count;
+}
+
 // ========== GLOBAL ANIMATION SYSTEM ==========
 void updateGlobalAnimations() {
   // Update global blink state every 500ms
@@ -161,7 +248,7 @@ const char* getConfigTabName(ConfigTab tab) {
   switch (tab) {
     case TAB_BASIC: return "BASIC";
     case TAB_LOGGING: return "LOGGING";
-    case TAB_ADVANCED: return "ADVANCED";
+    case TAB_CAN_MONITOR: return "CAN MON";
     default: return "BASIC";
   }
 }
@@ -170,7 +257,7 @@ const char* getConfigTabSubtitle(ConfigTab tab) {
   switch (tab) {
     case TAB_BASIC: return "基本設定";
     case TAB_LOGGING: return "ログ設定";
-    case TAB_ADVANCED: return "高度設定";
+    case TAB_CAN_MONITOR: return "CANモニター";
     default: return "基本設定";
   }
 }
@@ -215,6 +302,9 @@ struct ECUData {
   float boost_adjustment = 0.0;
   int launch_rpm = 4000;
   bool system_ready = true;
+
+  // Additional data fields (not in CAN stream but needed for display)
+  float speed = 0.0;
 };
 
 ECUData ecu_data;
@@ -249,7 +339,7 @@ void parseCustomStream1(const twai_message_t& message) {
     ecu_data.rpm = ((message.data[1] << 8) | message.data[0]) * 0.1;
     ecu_data.tps = message.data[2] * 0.5;
     ecu_data.aps = message.data[3] * 0.5;
-    ecu_data.mgp = ((message.data[5] << 8) | message.data[4]) * 0.1 - 100;
+    ecu_data.mgp = ((message.data[5] << 8) | message.data[4]) * 0.1;
     ecu_data.ect = message.data[6] - 40;
     ecu_data.iat = message.data[7] - 40;
   }
@@ -287,6 +377,9 @@ bool readCANData() {
     data_received = true;
     last_can_message = millis();
 
+    // Update CAN monitoring statistics
+    updateCANStats(message.identifier, message.data, message.data_length_code);
+
     if (config.use_custom_streams) {
       switch (message.identifier) {
         case CUSTOM_STREAM_ID_1:
@@ -301,6 +394,14 @@ bool readCANData() {
       }
     }
     // Add Haltech IC7 parsing here if needed
+
+    // Calculate approximate speed from RPM (since not in CAN stream)
+    if (ecu_data.rpm > 0) {
+      // Simple speed estimation based on RPM (adjust these ratios for your vehicle)
+      // Using average gear ratio for speed calculation
+      ecu_data.speed = ecu_data.rpm * 0.045; // Average gear ratio
+      ecu_data.speed = constrain(ecu_data.speed, 0.0, 300.0);
+    }
   }
 
   return data_received;
@@ -370,7 +471,7 @@ void loadConfig() {
   preferences.begin("link_g4x", false);
 
   config.base_can_id = preferences.getUInt("base_can_id", 864);
-  config.can_speed = preferences.getUInt("can_speed", 500000);
+  config.can_speed = preferences.getUInt("can_speed", 1000000);
   config.simulation_mode = preferences.getBool("simulation", true);
   config.use_custom_streams = preferences.getBool("custom_streams", true);
 
@@ -645,6 +746,10 @@ void refreshConfigBlinkingDots() {
       }
       break;
 
+    case TAB_CAN_MONITOR:
+      // No blinking dots needed for CAN monitor - it's a real-time display
+      break;
+
     case TAB_LOGGING:
       {
         // Variable number of sections based on logging state
@@ -673,19 +778,7 @@ void refreshConfigBlinkingDots() {
       }
       break;
 
-    case TAB_ADVANCED:
-      {
-        // 1 section in ADVANCED tab
-        int y = section_y;
-        uint16_t accent_color = M5.Display.color565(150, 150, 150);
 
-        // Clear dot area and redraw
-        M5.Display.fillCircle(section_x + section_w - 25, y + 25, 5, M5.Display.color565(40, 40, 80));
-        if (global_blink_state) {
-          M5.Display.fillCircle(section_x + section_w - 25, y + 25, 4, accent_color);
-        }
-      }
-      break;
   }
 }
 
@@ -698,6 +791,108 @@ enum ControlPreset {
 };
 
 ControlPreset current_preset = PRESET_STREET;
+
+void drawCANMonitoringDisplay(int start_y) {
+  int screen_w = M5.Display.width();
+  int line_height = 35;
+  int current_y = start_y;
+
+  // Header section with overall stats
+  M5.Display.fillRect(20, current_y, screen_w - 40, 60, M5.Display.color565(20, 40, 80));
+  M5.Display.drawRect(20, current_y, screen_w - 40, 60, M5.Display.color565(0, 255, 255));
+
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(M5.Display.color565(0, 255, 255));
+  M5.Display.setTextDatum(textdatum_t::top_left);
+
+  char stats_line1[60], stats_line2[60];
+  uint32_t uptime_sec = (millis() - last_can_stats_reset) / 1000;
+  sprintf(stats_line1, "Total Frames: %lu  Errors: %lu  Speed: %s", total_can_frames, can_errors, getCANSpeedName());
+  sprintf(stats_line2, "Uptime: %lu:%02lu  Active IDs: %d", uptime_sec / 60, uptime_sec % 60,
+          countActiveFrames());
+
+  M5.Display.drawString(stats_line1, 30, current_y + 10);
+  M5.Display.drawString(stats_line2, 30, current_y + 30);
+  current_y += 70;
+
+  // Column headers
+  M5.Display.setTextColor(M5.Display.color565(255, 255, 0));
+  M5.Display.drawString("CAN ID", 30, current_y);
+  M5.Display.drawString("COUNT", 150, current_y);
+  M5.Display.drawString("RATE", 220, current_y);
+  M5.Display.drawString("LAST DATA", 290, current_y);
+  M5.Display.drawString("AGE", 500, current_y);
+  current_y += 25;
+
+  // Draw separator line
+  M5.Display.drawLine(20, current_y, screen_w - 20, current_y, M5.Display.color565(100, 100, 100));
+  current_y += 10;
+
+  // Display active CAN frames
+  int displayed_frames = 0;
+  for (int i = 0; i < MAX_MONITORED_FRAMES && displayed_frames < 8; i++) {
+    if (!can_frame_stats[i].active) continue;
+
+    uint32_t age_ms = millis() - can_frame_stats[i].last_seen;
+    bool is_recent = age_ms < 1000;
+    uint16_t text_color = is_recent ? TFT_WHITE : M5.Display.color565(150, 150, 150);
+
+    M5.Display.setTextColor(text_color);
+    M5.Display.setTextDatum(textdatum_t::top_left);
+
+    // CAN ID (hex)
+    char id_str[10];
+    sprintf(id_str, "0x%03X", can_frame_stats[i].can_id);
+    M5.Display.drawString(id_str, 30, current_y);
+
+    // Packet count
+    char count_str[10];
+    if (can_frame_stats[i].packet_count > 9999) {
+      sprintf(count_str, "%luk", can_frame_stats[i].packet_count / 1000);
+    } else {
+      sprintf(count_str, "%lu", can_frame_stats[i].packet_count);
+    }
+    M5.Display.drawString(count_str, 150, current_y);
+
+    // Calculate rate (packets per second)
+    uint32_t time_active = millis() - last_can_stats_reset;
+    float rate = time_active > 0 ? (float)can_frame_stats[i].packet_count * 1000.0 / time_active : 0;
+    char rate_str[10];
+    sprintf(rate_str, "%.1fHz", rate);
+    M5.Display.drawString(rate_str, 220, current_y);
+
+    // Last data (first 4 bytes in hex)
+    char data_str[20];
+    sprintf(data_str, "%02X %02X %02X %02X",
+            can_frame_stats[i].last_data[0], can_frame_stats[i].last_data[1],
+            can_frame_stats[i].last_data[2], can_frame_stats[i].last_data[3]);
+    M5.Display.drawString(data_str, 290, current_y);
+
+    // Age
+    char age_str[10];
+    if (age_ms < 1000) {
+      sprintf(age_str, "%lums", age_ms);
+    } else {
+      sprintf(age_str, "%.1fs", age_ms / 1000.0);
+    }
+    M5.Display.drawString(age_str, 500, current_y);
+
+    current_y += line_height;
+    displayed_frames++;
+  }
+
+  // Reset button
+  int button_w = 120;
+  int button_h = 40;
+  int button_x = screen_w - button_w - 30;
+  int button_y = start_y + 400;
+
+  M5.Display.fillRoundRect(button_x, button_y, button_w, button_h, 8, M5.Display.color565(80, 40, 40));
+  M5.Display.drawRoundRect(button_x, button_y, button_w, button_h, 8, M5.Display.color565(255, 100, 100));
+  M5.Display.setTextColor(TFT_WHITE);
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+  M5.Display.drawString("RESET", button_x + button_w/2, button_y + button_h/2);
+}
 
 void showConfigurationPage() {
   int screen_w = M5.Display.width();
@@ -818,9 +1013,7 @@ void showConfigurationPage() {
       section_y += section_h + section_spacing;
 
       // CAN Speed Section
-      char can_speed_text[20];
-      sprintf(can_speed_text, "%d KBPS", config.can_speed / 1000);
-      drawJDMConfigSection("CAN SPEED", "CAN速度", section_y, can_speed_text, M5.Display.color565(255, 255, 0));
+      drawJDMConfigSection("CAN SPEED", "CAN速度", section_y, getCANSpeedName(), M5.Display.color565(255, 255, 0));
       section_y += section_h + section_spacing;
 
       // CAN ID Section
@@ -865,10 +1058,8 @@ void showConfigurationPage() {
       }
       break;
 
-    case TAB_ADVANCED:
-      // Future advanced settings will go here
-      drawJDMConfigSection("COMING SOON", "近日公開", section_y, "ADVANCED FEATURES",
-                          M5.Display.color565(150, 150, 150));
+    case TAB_CAN_MONITOR:
+      drawCANMonitoringDisplay(content_y);
       break;
   }
 
@@ -1271,6 +1462,15 @@ static float last_iat_value = -999.0;
 static LGFX_Sprite iat_sprite(&M5.Display);
 static bool iat_sprite_created = false;
 
+// Additional tracking variables for CAN data mode
+static float last_boost_value = -999.0;
+static float last_ect_value = -999.0;
+static float last_oil_press_value = -1.0;
+static float last_fuel_press_value = -1.0;
+static float last_battery_value = -1.0;
+static float last_speed_value = -1.0;
+static float last_ethanol_value = -1.0;
+
 void drawIATGauge(int x, int y, int w, int h) {
   if (abs(ecu_data.iat - last_iat_value) < 1 && last_iat_value != -999.0) {
     return;
@@ -1458,7 +1658,7 @@ float sim_oil_press = 0.5;
 float sim_fuel_press = 3.0;
 float sim_battery = 12.6;
 float sim_speed = 0.0;
-int sim_gear = 1;
+float sim_ethanol = 85.0;
 float sim_lambda = 1.0;
 float sim_lambda_target = 1.0;
 
@@ -1472,7 +1672,7 @@ float last_sim_oil_press = -1;
 float last_sim_fuel_press = -1;
 float last_sim_battery = -1;
 float last_sim_speed = -1;
-int last_sim_gear = -1;
+float last_sim_ethanol = -1.0;
 float last_sim_lambda = -1;
 float last_sim_lambda_target = -1;
 
@@ -1583,12 +1783,9 @@ void updateSimulationData() {
   sim_speed += (target_speed - sim_speed) * dt * 1.5;
   sim_speed = constrain(sim_speed, 0.0, 200.0);
 
-  // Gear simulation (simplified)
-  if (sim_speed < 20) sim_gear = 1;
-  else if (sim_speed < 50) sim_gear = 2;
-  else if (sim_speed < 80) sim_gear = 3;
-  else if (sim_speed < 120) sim_gear = 4;
-  else sim_gear = 5;
+  // Ethanol percentage simulation (varies slightly over time)
+  sim_ethanol += random(-1, 1) * 0.1;
+  sim_ethanol = constrain(sim_ethanol, 80.0, 87.0); // E80-E87 range
 
   // Lambda simulation
   if (sim_engine_running) {
@@ -1901,6 +2098,13 @@ void resetGaugeStates() {
   extern float last_iat_value;
   extern float last_lambda_value;
   extern float last_lambda_target;
+  extern float last_boost_value;
+  extern float last_ect_value;
+  extern float last_oil_press_value;
+  extern float last_fuel_press_value;
+  extern float last_battery_value;
+  extern float last_speed_value;
+  extern float last_ethanol_value;
 
   // Reset all gauge states to force full redraw
   last_rpm_gauge_value = -1.0;
@@ -1909,6 +2113,13 @@ void resetGaugeStates() {
   last_iat_value = -999.0;
   last_lambda_value = -1.0;
   last_lambda_target = -1.0;
+  last_boost_value = -999.0;
+  last_ect_value = -999.0;
+  last_oil_press_value = -1.0;
+  last_fuel_press_value = -1.0;
+  last_battery_value = -1.0;
+  last_speed_value = -1.0;
+  last_ethanol_value = -1.0;
 
   // Reset efficient gauge system
   gauges_layout_initialized = false;
@@ -1921,7 +2132,7 @@ void resetGaugeStates() {
   last_sim_fuel_press = -1;
   last_sim_battery = -1;
   last_sim_speed = -1;
-  last_sim_gear = -1;
+  last_sim_ethanol = -1.0;
   last_sim_lambda = -1;
   last_sim_lambda_target = -1;
 
@@ -2035,7 +2246,7 @@ void showGaugesPage() {
                     "SPEED", "KM/H", M5.Display.color565(0, 255, 255), 2);
 
     drawGaugeStatic(side_margin + 4*(bot_gauge_w + gap), bot_y, bot_gauge_w, row_height,
-                    "GEAR", "", M5.Display.color565(255, 0, 255), 2);
+                    "ETHANOL", "%", M5.Display.color565(255, 0, 255), 2);
 
     // Draw initial values
     M5.Display.setTextSize(7);
@@ -2065,39 +2276,69 @@ void showGaugesPage() {
     Serial.println("Gauge layout initialized - complete gauges drawn with labels and units");
   }
 
-  // Update simulation data
-  updateSimulationData();
+  // Update simulation data if in simulation mode
+  if (config.simulation_mode) {
+    updateSimulationData();
+  }
 
-  // Prepare simulated values as strings
+  // Prepare values as strings - use appropriate data source
   char rpm_str[10], tps_str[10], boost_str[10], iat_str[10], ect_str[10];
-  char oil_press_str[10], fuel_press_str[10], battery_str[10], speed_str[10], gear_str[10];
+  char oil_press_str[10], fuel_press_str[10], battery_str[10], speed_str[10], ethanol_str[10];
   char last_rpm_str[10], last_tps_str[10], last_boost_str[10], last_iat_str[10], last_ect_str[10];
-  char last_oil_press_str[10], last_fuel_press_str[10], last_battery_str[10], last_speed_str[10], last_gear_str[10];
+  char last_oil_press_str[10], last_fuel_press_str[10], last_battery_str[10], last_speed_str[10], last_ethanol_str[10];
 
-  sprintf(rpm_str, "%.0f", sim_rpm);
-  sprintf(tps_str, "%.1f", sim_tps);
-  sprintf(boost_str, "%.1f", convertPressure(sim_boost));
-  sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
-  sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
-  sprintf(oil_press_str, "%.1f", sim_oil_press);
-  sprintf(fuel_press_str, "%.1f", sim_fuel_press);
-  sprintf(battery_str, "%.1f", sim_battery);
-  sprintf(speed_str, "%.0f", sim_speed);
-  sprintf(gear_str, "%d", sim_gear);
+  if (config.simulation_mode) {
+    // Use simulation data
+    sprintf(rpm_str, "%.0f", sim_rpm);
+    sprintf(tps_str, "%.1f", sim_tps);
+    sprintf(boost_str, "%.1f", convertPressure(sim_boost));
+    sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
+    sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
+    sprintf(oil_press_str, "%.1f", sim_oil_press);
+    sprintf(fuel_press_str, "%.1f", sim_fuel_press);
+    sprintf(battery_str, "%.1f", sim_battery);
+    sprintf(speed_str, "%.0f", sim_speed);
+    sprintf(ethanol_str, "%.0f", sim_ethanol);
 
-  sprintf(last_rpm_str, "%.0f", last_sim_rpm);
-  sprintf(last_tps_str, "%.1f", last_sim_tps);
-  sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
-  sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
-  sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
-  sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
-  sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
-  sprintf(last_battery_str, "%.1f", last_sim_battery);
-  sprintf(last_speed_str, "%.0f", last_sim_speed);
-  sprintf(last_gear_str, "%d", last_sim_gear);
+    sprintf(last_rpm_str, "%.0f", last_sim_rpm);
+    sprintf(last_tps_str, "%.1f", last_sim_tps);
+    sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
+    sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
+    sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
+    sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
+    sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
+    sprintf(last_battery_str, "%.1f", last_sim_battery);
+    sprintf(last_speed_str, "%.0f", last_sim_speed);
+    sprintf(last_ethanol_str, "%.0f", last_sim_ethanol);
+  } else {
+    // Use real CAN data
+    sprintf(rpm_str, "%.0f", ecu_data.rpm);
+    sprintf(tps_str, "%.1f", ecu_data.tps);
+    sprintf(boost_str, "%.1f", convertPressure(ecu_data.mgp));
+    sprintf(iat_str, "%.0f", convertTemperature(ecu_data.iat));
+    sprintf(ect_str, "%.0f", convertTemperature(ecu_data.ect));
+    sprintf(oil_press_str, "%.1f", ecu_data.oil_press);
+    sprintf(fuel_press_str, "%.1f", ecu_data.fuel_press);
+    sprintf(battery_str, "%.1f", ecu_data.battery);
+    sprintf(speed_str, "%.0f", ecu_data.speed);
+    sprintf(ethanol_str, "%.0f", ecu_data.ethanol_percent);
+
+    // For CAN data, use previous ecu_data values for comparison
+    sprintf(last_rpm_str, "%.0f", last_rpm_gauge_value);
+    sprintf(last_tps_str, "%.1f", last_tps_value);
+    sprintf(last_boost_str, "%.1f", convertPressure(last_boost_value));
+    sprintf(last_iat_str, "%.0f", convertTemperature(last_iat_value));
+    sprintf(last_ect_str, "%.0f", convertTemperature(last_ect_value));
+    sprintf(last_oil_press_str, "%.1f", last_oil_press_value);
+    sprintf(last_fuel_press_str, "%.1f", last_fuel_press_value);
+    sprintf(last_battery_str, "%.1f", last_battery_value);
+    sprintf(last_speed_str, "%.0f", last_speed_value);
+    sprintf(last_ethanol_str, "%.0f", last_ethanol_value);
+  }
 
   // EFFICIENT UPDATES - Only update changed values
-  uint16_t rpm_color = sim_rpm > 7000 ? M5.Display.color565(255, 0, 0) : TFT_WHITE;
+  float current_rpm = config.simulation_mode ? sim_rpm : ecu_data.rpm;
+  uint16_t rpm_color = current_rpm > 7000 ? M5.Display.color565(255, 0, 0) : TFT_WHITE;
   updateGaugeValue(gauge_positions[0].x, gauge_positions[0].y, gauge_positions[0].w, gauge_positions[0].h,
                    rpm_str, last_rpm_str, 6, rpm_color);
 
@@ -2129,21 +2370,34 @@ void showGaugesPage() {
   updateGaugeValue(gauge_positions[9].x, gauge_positions[9].y, gauge_positions[9].w, gauge_positions[9].h,
                    speed_str, last_speed_str, 3, TFT_WHITE);
 
-  // Gear gauge (special position)
+  // Ethanol gauge (special position)
   updateGaugeValue(side_margin + 4*(bot_gauge_w + gap), bot_y, bot_gauge_w, row_height,
-                   gear_str, last_gear_str, 5, TFT_WHITE);
+                   ethanol_str, last_ethanol_str, 4, TFT_WHITE);
 
   // Update last values for next comparison
-  last_sim_rpm = sim_rpm;
-  last_sim_tps = sim_tps;
-  last_sim_boost = sim_boost;
-  last_sim_iat = sim_iat;
-  last_sim_ect = sim_ect;
-  last_sim_oil_press = sim_oil_press;
-  last_sim_fuel_press = sim_fuel_press;
-  last_sim_battery = sim_battery;
-  last_sim_speed = sim_speed;
-  last_sim_gear = sim_gear;
+  if (config.simulation_mode) {
+    last_sim_rpm = sim_rpm;
+    last_sim_tps = sim_tps;
+    last_sim_boost = sim_boost;
+    last_sim_iat = sim_iat;
+    last_sim_ect = sim_ect;
+    last_sim_oil_press = sim_oil_press;
+    last_sim_fuel_press = sim_fuel_press;
+    last_sim_battery = sim_battery;
+    last_sim_speed = sim_speed;
+    last_sim_ethanol = sim_ethanol;
+  } else {
+    last_rpm_gauge_value = ecu_data.rpm;
+    last_tps_value = ecu_data.tps;
+    last_boost_value = ecu_data.mgp;
+    last_iat_value = ecu_data.iat;
+    last_ect_value = ecu_data.ect;
+    last_oil_press_value = ecu_data.oil_press;
+    last_fuel_press_value = ecu_data.fuel_press;
+    last_battery_value = ecu_data.battery;
+    last_speed_value = ecu_data.speed;
+    last_ethanol_value = ecu_data.ethanol_percent;
+  }
 
   // Bottom navigation (compact)
   M5.Display.fillRect(0, screen_h - 50, screen_w, 50, M5.Display.color565(30, 30, 30));
@@ -2242,7 +2496,8 @@ void drawBoostMapSelector(int x, int y, int w, int h) {
   M5.Display.setTextColor(TFT_WHITE);
   M5.Display.setTextDatum(textdatum_t::bottom_center);
   char boost_str[20];
-  sprintf(boost_str, "%.1f %s", convertPressure(sim_boost), getPressureUnit());
+  float current_boost = config.simulation_mode ? sim_boost : ecu_data.mgp;
+  sprintf(boost_str, "%.1f %s", convertPressure(current_boost), getPressureUnit());
   M5.Display.drawString(boost_str, x + w/2, y + h - 15);
 }
 
@@ -2288,7 +2543,8 @@ void drawBoostAdjustment(int x, int y, int w, int h) {
   M5.Display.setTextColor(M5.Display.color565(200, 200, 200));
   M5.Display.setTextDatum(textdatum_t::bottom_center);
   char target_str[30];
-  sprintf(target_str, "Target: %.1f %s", convertPressure(sim_boost + ecu_data.boost_adjustment), getPressureUnit());
+  float current_boost = config.simulation_mode ? sim_boost : ecu_data.mgp;
+  sprintf(target_str, "Target: %.1f %s", convertPressure(current_boost + ecu_data.boost_adjustment), getPressureUnit());
   M5.Display.drawString(target_str, x + w/2, y + h - 15);
 }
 
@@ -2420,8 +2676,9 @@ void showControlPage() {
 
   // Boost Display (3rd control)
   char boost_current[15], boost_target[15];
-  sprintf(boost_current, "%.1f %s", convertPressure(sim_boost), getPressureUnit());
-  sprintf(boost_target, "%.1f %s", convertPressure(sim_boost + ecu_data.boost_adjustment), getPressureUnit());
+  float current_boost = config.simulation_mode ? sim_boost : ecu_data.mgp;
+  sprintf(boost_current, "%.1f %s", convertPressure(current_boost), getPressureUnit());
+  sprintf(boost_target, "%.1f %s", convertPressure(current_boost + ecu_data.boost_adjustment), getPressureUnit());
   drawControlButton(side_margin + 2*(top_control_w + gap), top_y, top_control_w, row_height,
                     "BOOST DISPLAY", boost_current, ecu_data.boost_control_active,
                     M5.Display.color565(255, 165, 0));
@@ -2506,6 +2763,9 @@ void setup() {
 
   // Initialize M5 hardware
   M5.begin();
+
+  // Initialize CAN monitoring
+  initCANMonitoring();
 
   // Speaker initialization disabled for testing
   // auto cfg = M5.config();
@@ -2634,6 +2894,23 @@ bool handleConfigTouch(int x, int y) {
           default: config.can_speed = 500000; break;
         }
         saveConfig();
+
+        // Reinitialize CAN bus with new speed if not in simulation mode
+        if (!config.simulation_mode) {
+          Serial.printf("Reinitializing CAN bus at %d kbps...\n", config.can_speed / 1000);
+          ESP32Can.end(); // Stop current CAN
+          delay(100);     // Brief delay for cleanup
+          if (!initializeCAN()) {
+            Serial.println("CAN reinitialization failed! Falling back to simulation mode");
+            config.simulation_mode = true;
+            saveConfig();
+          } else {
+            Serial.println("CAN reinitialization successful");
+            // Reset CAN monitoring stats since we're starting fresh
+            resetCANStats();
+          }
+        }
+
         showConfigurationPage(); // Refresh display
         Serial.printf("CAN speed changed to: %d kbps\n", config.can_speed / 1000);
         return true;
@@ -2731,9 +3008,22 @@ bool handleConfigTouch(int x, int y) {
       }
       break;
 
-    case TAB_ADVANCED:
-      // Future advanced settings will be handled here
-      // For now, no interactive sections
+    case TAB_CAN_MONITOR:
+      // Check for reset button touch
+      {
+        int button_w = 120;
+        int button_h = 40;
+        int button_x = screen_w - button_w - 30;
+        int button_y = content_y + 400;
+
+        if (x >= button_x && x <= button_x + button_w &&
+            y >= button_y && y <= button_y + button_h) {
+          resetCANStats();
+          showConfigurationPage(); // Refresh display
+          Serial.println("CAN statistics reset");
+          return true;
+        }
+      }
       break;
   }
 
@@ -3098,41 +3388,70 @@ void loop() {
       refreshConfigBlinkingDots();
       last_refresh = millis();
     } else if (current_mode == MODE_GAUGES && millis() - last_refresh > 100) {
-      // Efficient refresh - only update simulation and changed values
-      updateSimulationData();
+      // Efficient refresh - only update simulation data if in simulation mode
+      if (config.simulation_mode) {
+        updateSimulationData();
+      }
 
       // Only update if we're still on the gauges page and layout is initialized
       if (current_mode == MODE_GAUGES && gauges_layout_initialized) {
         // Efficient updates - only redraw changed values
         char rpm_str[10], tps_str[10], boost_str[10], iat_str[10], ect_str[10];
-        char oil_press_str[10], fuel_press_str[10], battery_str[10], speed_str[10], gear_str[10];
+        char oil_press_str[10], fuel_press_str[10], battery_str[10], speed_str[10], ethanol_str[10];
         char last_rpm_str[10], last_tps_str[10], last_boost_str[10], last_iat_str[10], last_ect_str[10];
-        char last_oil_press_str[10], last_fuel_press_str[10], last_battery_str[10], last_speed_str[10], last_gear_str[10];
+        char last_oil_press_str[10], last_fuel_press_str[10], last_battery_str[10], last_speed_str[10], last_ethanol_str[10];
 
-        sprintf(rpm_str, "%.0f", sim_rpm);
-        sprintf(tps_str, "%.1f", sim_tps);
-        sprintf(boost_str, "%.1f", convertPressure(sim_boost));
-        sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
-        sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
-        sprintf(oil_press_str, "%.1f", sim_oil_press);
-        sprintf(fuel_press_str, "%.1f", sim_fuel_press);
-        sprintf(battery_str, "%.1f", sim_battery);
-        sprintf(speed_str, "%.0f", sim_speed);
-        sprintf(gear_str, "%d", sim_gear);
+        if (config.simulation_mode) {
+          // Use simulation data
+          sprintf(rpm_str, "%.0f", sim_rpm);
+          sprintf(tps_str, "%.1f", sim_tps);
+          sprintf(boost_str, "%.1f", convertPressure(sim_boost));
+          sprintf(iat_str, "%.0f", convertTemperature(sim_iat));
+          sprintf(ect_str, "%.0f", convertTemperature(sim_ect));
+          sprintf(oil_press_str, "%.1f", sim_oil_press);
+          sprintf(fuel_press_str, "%.1f", sim_fuel_press);
+          sprintf(battery_str, "%.1f", sim_battery);
+          sprintf(speed_str, "%.0f", sim_speed);
+          sprintf(ethanol_str, "%.0f", sim_ethanol);
 
-        sprintf(last_rpm_str, "%.0f", last_sim_rpm);
-        sprintf(last_tps_str, "%.1f", last_sim_tps);
-        sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
-        sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
-        sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
-        sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
-        sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
-        sprintf(last_battery_str, "%.1f", last_sim_battery);
-        sprintf(last_speed_str, "%.0f", last_sim_speed);
-        sprintf(last_gear_str, "%d", last_sim_gear);
+          sprintf(last_rpm_str, "%.0f", last_sim_rpm);
+          sprintf(last_tps_str, "%.1f", last_sim_tps);
+          sprintf(last_boost_str, "%.1f", convertPressure(last_sim_boost));
+          sprintf(last_iat_str, "%.0f", convertTemperature(last_sim_iat));
+          sprintf(last_ect_str, "%.0f", convertTemperature(last_sim_ect));
+          sprintf(last_oil_press_str, "%.1f", last_sim_oil_press);
+          sprintf(last_fuel_press_str, "%.1f", last_sim_fuel_press);
+          sprintf(last_battery_str, "%.1f", last_sim_battery);
+          sprintf(last_speed_str, "%.0f", last_sim_speed);
+          sprintf(last_ethanol_str, "%.0f", last_sim_ethanol);
+        } else {
+          // Use real CAN data
+          sprintf(rpm_str, "%.0f", ecu_data.rpm);
+          sprintf(tps_str, "%.1f", ecu_data.tps);
+          sprintf(boost_str, "%.1f", convertPressure(ecu_data.mgp));
+          sprintf(iat_str, "%.0f", convertTemperature(ecu_data.iat));
+          sprintf(ect_str, "%.0f", convertTemperature(ecu_data.ect));
+          sprintf(oil_press_str, "%.1f", ecu_data.oil_press);
+          sprintf(fuel_press_str, "%.1f", ecu_data.fuel_press);
+          sprintf(battery_str, "%.1f", ecu_data.battery);
+          sprintf(speed_str, "%.0f", ecu_data.speed);
+          sprintf(ethanol_str, "%.0f", ecu_data.ethanol_percent);
+
+          sprintf(last_rpm_str, "%.0f", last_rpm_gauge_value);
+          sprintf(last_tps_str, "%.1f", last_tps_value);
+          sprintf(last_boost_str, "%.1f", convertPressure(last_boost_value));
+          sprintf(last_iat_str, "%.0f", convertTemperature(last_iat_value));
+          sprintf(last_ect_str, "%.0f", convertTemperature(last_ect_value));
+          sprintf(last_oil_press_str, "%.1f", last_oil_press_value);
+          sprintf(last_fuel_press_str, "%.1f", last_fuel_press_value);
+          sprintf(last_battery_str, "%.1f", last_battery_value);
+          sprintf(last_speed_str, "%.0f", last_speed_value);
+          sprintf(last_ethanol_str, "%.0f", last_ethanol_value);
+        }
 
         // Update only changed values
-        uint16_t rpm_color = sim_rpm > 7000 ? M5.Display.color565(255, 0, 0) : TFT_WHITE;
+        float current_rpm = config.simulation_mode ? sim_rpm : ecu_data.rpm;
+        uint16_t rpm_color = current_rpm > 7000 ? M5.Display.color565(255, 0, 0) : TFT_WHITE;
         updateGaugeValue(gauge_positions[0].x, gauge_positions[0].y, gauge_positions[0].w, gauge_positions[0].h,
                          rpm_str, last_rpm_str, 6, rpm_color);
 
@@ -3158,22 +3477,37 @@ void loop() {
                          speed_str, last_speed_str, 3, TFT_WHITE);
 
         // Update last values
-        last_sim_rpm = sim_rpm;
-        last_sim_tps = sim_tps;
-        last_sim_boost = sim_boost;
-        last_sim_iat = sim_iat;
-        last_sim_ect = sim_ect;
-        last_sim_oil_press = sim_oil_press;
-        last_sim_fuel_press = sim_fuel_press;
-        last_sim_battery = sim_battery;
-        last_sim_speed = sim_speed;
-        last_sim_gear = sim_gear;
+        if (config.simulation_mode) {
+          last_sim_rpm = sim_rpm;
+          last_sim_tps = sim_tps;
+          last_sim_boost = sim_boost;
+          last_sim_iat = sim_iat;
+          last_sim_ect = sim_ect;
+          last_sim_oil_press = sim_oil_press;
+          last_sim_fuel_press = sim_fuel_press;
+          last_sim_battery = sim_battery;
+          last_sim_speed = sim_speed;
+          last_sim_ethanol = sim_ethanol;
+        } else {
+          last_rpm_gauge_value = ecu_data.rpm;
+          last_tps_value = ecu_data.tps;
+          last_boost_value = ecu_data.mgp;
+          last_iat_value = ecu_data.iat;
+          last_ect_value = ecu_data.ect;
+          last_oil_press_value = ecu_data.oil_press;
+          last_fuel_press_value = ecu_data.fuel_press;
+          last_battery_value = ecu_data.battery;
+          last_speed_value = ecu_data.speed;
+          last_ethanol_value = ecu_data.ethanol_percent;
+        }
       }
 
       last_refresh = millis();
     } else if (current_mode == MODE_CONTROL && millis() - last_refresh > 200) {
       // Refresh control page with updated values
-      updateSimulationData();
+      if (config.simulation_mode) {
+        updateSimulationData();
+      }
 
       // Update dynamic elements that change with simulation
       // For now, boost values and system status are the main dynamic elements

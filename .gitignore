@@ -1,6 +1,7 @@
 # PlatformIO build artifacts
 .pio/
 .vscode/
+.venv/
 .clang_complete
 .gcc-flags.json
 .ccls
